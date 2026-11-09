@@ -88,7 +88,10 @@ jobs:
         run: |
           set -euo pipefail
           UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
-          OUT=android/app/build/outputs/apk/release/JPG2UltraHDR-0.1.0-arm64.apk
+          # 版本号只在 app/build.gradle 里写一次，产物名从那里取
+          VERSION=$(grep -m1 'versionName' android/app/build.gradle | sed -E 's/.*"([^"]+)".*/\1/')
+          OUT="android/app/build/outputs/apk/release/JPG2UltraHDR-${VERSION}-arm64.apk"
+          echo "APK=$OUT" >> "$GITHUB_ENV"
           BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
 
           if [ -n "${KEYSTORE_B64:-}" ]; then
@@ -115,4 +118,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: jpg2ultrahdr-android
-          path: android-app/android/app/build/outputs/apk/release/JPG2UltraHDR-0.1.0-arm64.apk
+          path: ${{ env.APK }}

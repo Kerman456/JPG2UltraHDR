@@ -10,7 +10,7 @@ Android 应用。转换内核与 Windows 版完全共用（仓库根目录的 `s
 APK 只有 **arm64-v8a**（现代手机都是这个架构），系统要求 **Android 10（API 29）或更高**。
 
 ```bash
-adb install -r JPG2UltraHDR-0.1.0-arm64.apk
+adb install -r JPG2UltraHDR-0.1.1-arm64.apk
 ```
 
 也可以直接把 APK 传到手机上，用文件管理器点开安装（需要允许「安装未知来源应用」）。
@@ -128,7 +128,7 @@ rustup target `aarch64-linux-android`、Gradle 8.5。
 .\build-android.ps1 -Release -GradlePath "C:\gradle\bin\gradle.bat"
 ```
 
-产物：`android\app\build\outputs\apk\release\JPG2UltraHDR-0.1.0-arm64.apk`
+产物：`android\app\build\outputs\apk\release\JPG2UltraHDR-0.1.1-arm64.apk`
 
 手动分步：
 

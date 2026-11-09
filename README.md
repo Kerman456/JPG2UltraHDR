@@ -13,9 +13,9 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 
 不想自己编译的话，直接下打包好的版本：
 
-> **Windows**：[JPG2UltraHDR-v0.1.0-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/latest) — 解压即用，含主程序、说明文档和两个检查工具。
+> **Windows**：[JPG2UltraHDR-v0.1.1-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.1/JPG2UltraHDR-v0.1.1-windows-x64.zip) — 解压即用，含主程序、说明文档和两个检查工具。
 >
-> **Android**：[Releases 页](https://github.com/Kerman456/JPG2UltraHDR/releases) 里的 `JPG2UltraHDR-*-arm64.apk` — 直接装，需要 Android 10 或更高。
+> **Android**：[JPG2UltraHDR-0.1.1-arm64.apk](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.1/JPG2UltraHDR-0.1.1-arm64.apk) — 直接装，需要 Android 10 或更高。
 
 ![深色主题](docs/screenshot-dark.png)
 

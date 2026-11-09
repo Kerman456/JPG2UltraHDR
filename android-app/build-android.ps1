@@ -101,7 +101,22 @@ if (-not $GradlePath) {
 }
 Write-Host "==> Gradle: $GradlePath" -ForegroundColor DarkGray
 & $GradlePath $task --no-daemon
-if ($LASTEXITCODE -ne 0) { throw "gradle 失败" }
+$gradleOk = ($LASTEXITCODE -eq 0)
+
+# wrapper 首次运行需要联网下载 Gradle 发行包；本机若被 TLS 拦截会失败，
+# 这时自动退回本机已解压的 Gradle，不打断整个构建。
+if (-not $gradleOk -and $GradlePath -like "*gradlew*") {
+    $fallback = $null
+    $g = Get-Command gradle -ErrorAction SilentlyContinue
+    if ($g) { $fallback = $g.Source }
+    elseif (Test-Path "D:\gradle-8.5\bin\gradle.bat") { $fallback = "D:\gradle-8.5\bin\gradle.bat" }
+    if ($fallback) {
+        Write-Host "==> wrapper 失败（多半是拉不到发行包），改用本机 Gradle: $fallback" -ForegroundColor Yellow
+        & $fallback $task --no-daemon
+        $gradleOk = ($LASTEXITCODE -eq 0)
+    }
+}
+if (-not $gradleOk) { throw "gradle 失败" }
 Set-Location $root
 
 if ($Release) {
@@ -113,7 +128,10 @@ if ($Release) {
     if (-not $buildTools) { throw "找不到 build-tools。请检查 Android SDK 安装。" }
 
     $unsigned = "android\app\build\outputs\apk\release\app-release-unsigned.apk"
-    $apk = "android\app\build\outputs\apk\release\JPG2UltraHDR-0.1.0-arm64.apk"
+    # 版本号只在 app\build.gradle 里写一次
+    $ver = (Select-String -Path "android\app\build.gradle" -Pattern 'versionName\s+"([^"]+)"' |
+        Select-Object -First 1).Matches[0].Groups[1].Value
+    $apk = "android\app\build\outputs\apk\release\JPG2UltraHDR-$ver-arm64.apk"
     $keystore = "signing\release.jks"
     # 口令可用环境变量覆盖；默认值是为了兼容本机已有的密钥
     $ksPass = if ($env:JPG2ULTRAHDR_KS_PASS) { $env:JPG2ULTRAHDR_KS_PASS } else { "jpg2ultrahdr" }
