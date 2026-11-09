@@ -22,6 +22,12 @@ defaults:
   run:
     working-directory: android-app
 
+env:
+  APP_LIB_NAME: jpg2ultrahdr_android
+  APP_PACKAGE: com.kerman456.jpg2ultrahdr
+  NDK_VERSION: 27.3.13750724
+  BUILD_TOOLS: 35.0.0
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -34,13 +40,16 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK
+      # ubuntu-latest 已预装 Android SDK；不要用 android-actions/setup-android，
+      # 它会执行已被移除的 `sdkmanager tools` 并失败。
+      - name: Install NDK and build-tools
         run: |
-          # 与应用构建脚本保持一致；runner 上未预装时从这里装
-          sdkmanager --install "ndk;27.3.13750724"
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "ndk;${NDK_VERSION}" "build-tools;${BUILD_TOOLS}" \
+            "platforms;android-35" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -57,16 +66,10 @@ jobs:
           workspaces: android-app
 
       - name: Build Rust library (arm64-v8a)
-        env:
-          APP_LIB_NAME: jpg2ultrahdr_android
-          APP_PACKAGE: com.kerman456.jpg2ultrahdr
         run: |
           cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release
 
       - name: Build APK
-        env:
-          APP_LIB_NAME: jpg2ultrahdr_android
-          APP_PACKAGE: com.kerman456.jpg2ultrahdr
         run: |
           chmod +x android/gradlew
           cd android
@@ -80,16 +83,17 @@ jobs:
           set -euo pipefail
           UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
           OUT=android/app/build/outputs/apk/release/JPG2UltraHDR-0.1.0-arm64.apk
-          BT="$ANDROID_HOME/build-tools/35.0.0"
+          BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
 
           if [ -n "${KEYSTORE_B64:-}" ]; then
-            # 有仓库密钥就用它，保证用户能覆盖安装之前的版本
+            # 有正式密钥就用它，这样老用户能覆盖安装
             printf '%s' "$KEYSTORE_B64" | base64 -d > release.jks
             PASS="$KEYSTORE_PASS"
           else
-            # 没有密钥时生成一次性密钥：artifact 可安装，但和正式版签名不同
+            # 没有密钥时生成一次性密钥：产物可安装，但和正式版签名不同，
+            # 装上之后无法用正式版覆盖，仅作 CI 冒烟用
             echo "::warning::ANDROID_KEYSTORE_B64 未配置，本次用临时密钥签名"
-            PASS="ci-temp-$RANDOM$RANDOM"
+            PASS="ci-temp-$(date +%s)-$RANDOM"
             keytool -genkeypair -keystore release.jks -storetype JKS \
               -alias jpg2ultrahdr -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass "$PASS" -keypass "$PASS" \
