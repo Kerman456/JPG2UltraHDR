@@ -8,6 +8,12 @@
 
 单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行库，双击即用。
 
+## 下载
+
+不想自己编译的话，直接下打包好的 Windows 版：
+
+> **[JPG2UltraHDR-v0.1.0-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/latest)** — 解压即用，含主程序、说明文档和两个检查工具。
+
 ![深色主题](docs/screenshot-dark.png)
 
 <details>
