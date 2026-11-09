@@ -25,9 +25,13 @@ use ultrajpeg::{
 const OFFSET: f32 = 1.0 / 64.0;
 
 /// Namespaces that mark a JPEG as already carrying a gain map.
-const ULTRA_HDR_MARKERS: [&[u8]; 3] = [
+///
+/// The Google *container* namespace is deliberately NOT in this list: motion
+/// photos (Live Photos) use it to describe a still + video container without
+/// any gain map, so matching it produced false "already Ultra HDR" rejections.
+/// Only the gain-map namespace and the ISO 21496-1 marker are specific enough.
+const ULTRA_HDR_MARKERS: [&[u8]; 2] = [
     b"http://ns.adobe.com/hdr-gain-map/1.0/",
-    b"http://ns.google.com/photos/1.0/container/",
     b"urn:iso:std:iso:ts:21496:-1",
 ];
 

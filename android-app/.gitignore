@@ -1,0 +1,18 @@
+/target
+
+# Android 构建产物
+/android/.gradle
+/android/build
+/android/app/build
+/android/app/src/main/jniLibs
+/android/local.properties
+/android/.idea
+/android/.cxx
+/android/captures
+*.iml
+*.apk
+*.aab
+
+# 签名密钥：绝不入库（build-android.ps1 会在缺省时自动生成）
+/signing/*.jks
+/signing/*.keystore

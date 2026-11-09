@@ -9,6 +9,13 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 ultrajpeg = "0.5.0-rc8"
 ultrahdr-core = "0.2"
+rayon = "1"
+anyhow = "1"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+
+# 桌面 GUI 依赖：Android 端由独立的 crate 提供界面，这里不编译。
+[target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = [
     "glow",
     "default_fonts",
@@ -17,11 +24,7 @@ eframe = { version = "0.36", default-features = false, features = [
 ] }
 modern-egui = "0.2"
 rfd = "0.18"
-rayon = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-anyhow = "1"
-zune-jpeg = "0.5"
-zune-core = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
 
 [profile.release]
 opt-level = 3

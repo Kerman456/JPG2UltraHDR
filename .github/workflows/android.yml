@@ -1,0 +1,108 @@
+name: android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android-app/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "android-app/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: android-app
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          # 与应用构建脚本保持一致；runner 上未预装时从这里装
+          sdkmanager --install "ndk;27.3.13750724"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android-app
+
+      - name: Build Rust library (arm64-v8a)
+        env:
+          APP_LIB_NAME: jpg2ultrahdr_android
+          APP_PACKAGE: com.kerman456.jpg2ultrahdr
+        run: |
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release
+
+      - name: Build APK
+        env:
+          APP_LIB_NAME: jpg2ultrahdr_android
+          APP_PACKAGE: com.kerman456.jpg2ultrahdr
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          set -euo pipefail
+          UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          OUT=android/app/build/outputs/apk/release/JPG2UltraHDR-0.1.0-arm64.apk
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+
+          if [ -n "${KEYSTORE_B64:-}" ]; then
+            # 有仓库密钥就用它，保证用户能覆盖安装之前的版本
+            printf '%s' "$KEYSTORE_B64" | base64 -d > release.jks
+            PASS="$KEYSTORE_PASS"
+          else
+            # 没有密钥时生成一次性密钥：artifact 可安装，但和正式版签名不同
+            echo "::warning::ANDROID_KEYSTORE_B64 未配置，本次用临时密钥签名"
+            PASS="ci-temp-$RANDOM$RANDOM"
+            keytool -genkeypair -keystore release.jks -storetype JKS \
+              -alias jpg2ultrahdr -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=CI, OU=Dev, O=JPG2UltraHDR, L=Shanghai, ST=Shanghai, C=CN"
+          fi
+
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$OUT"
+          "$BT/apksigner" sign --ks release.jks --ks-pass "pass:$PASS" \
+            --key-pass "pass:$PASS" --ks-key-alias jpg2ultrahdr "$OUT"
+          "$BT/apksigner" verify --print-certs "$OUT"
+          rm -f release.jks
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jpg2ultrahdr-android
+          path: android-app/android/app/build/outputs/apk/release/JPG2UltraHDR-0.1.0-arm64.apk

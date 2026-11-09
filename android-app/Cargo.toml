@@ -1,0 +1,37 @@
+[package]
+name = "jpg2ultrahdr-android"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Android UI for converting ordinary JPEG photos into Ultra HDR JPEG images"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "jpg2ultrahdr_android"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+jpg2ultrahdr = { path = ".." }
+egui-android-framework = "0.4.0-alpha.4"
+egui = "0.35"
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["game-activity"] }
+android_logger = "0.14"
+jni = "0.21"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# egui 0.35 上游有两个触摸滚动缺陷，框架仓库自带补丁（patches/egui）：
+#   1. `PointerState::begin_pass` 里 old_pos 还是上一帧的值，新一次按下时
+#      pointer.delta() 会算成「上一帧位置 → 本次按下位置」的整段距离，
+#      于是每次触摸都瞬间跳上百像素。
+#   2. ScrollArea 在 drag_started 时没有清掉上一次 fling 的残余速度。
+# 不应用这个补丁，滑动就会「突然闪到一个位置，且每次都从那一个位置开始」。
+[patch.crates-io]
+egui = { path = "vendor/egui" }

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 读写相册需要（minSdk 29 起用 MediaStore，无需 WRITE_EXTERNAL_STORAGE） -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
+    <application
+        android:label="JPG 转 Ultra HDR"
+        android:hasCode="true">
+
+        <activity
+            android:name="com.example.egui_android.EguiActivity"
+            android:exported="true"
+            android:label="JPG 转 Ultra HDR"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density"
+            android:theme="@style/AppTheme">
+            <meta-data android:name="android.app.lib_name" android:value="jpg2ultrahdr_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

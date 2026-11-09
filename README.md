@@ -1,18 +1,21 @@
 # JPG → Ultra HDR
 
-把普通 SDR JPEG 照片转换成 **Ultra HDR** JPEG 的 Windows 桌面程序。
+把普通 SDR JPEG 照片转换成 **Ultra HDR** JPEG 的转换工具，同时提供 **Windows 桌面版**和 **Android 版**。
 
 转换后的文件仍然是标准的、任何软件都能打开的 JPEG，只是额外附带了一张增益图（gain map）。
 支持 HDR 的查看器（Windows 照片、Chrome / Edge、Google 相册、Pixel 手机等）会按增益图把高光提亮；
 不支持的查看器看到的仍是完全正常的 SDR 画面，不会有任何色偏或异常。
 
-单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行库，双击即用。
+Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行库，双击即用。
+两个平台共用同一套转换内核（`src/lib.rs`），只有界面层不同。
 
 ## 下载
 
-不想自己编译的话，直接下打包好的 Windows 版：
+不想自己编译的话，直接下打包好的版本：
 
-> **[JPG2UltraHDR-v0.1.0-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/latest)** — 解压即用，含主程序、说明文档和两个检查工具。
+> **Windows**：[JPG2UltraHDR-v0.1.0-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/latest) — 解压即用，含主程序、说明文档和两个检查工具。
+>
+> **Android**：[Releases 页](https://github.com/Kerman456/JPG2UltraHDR/releases) 里的 `JPG2UltraHDR-*-arm64.apk` — 直接装，需要 Android 10 或更高。
 
 ![深色主题](docs/screenshot-dark.png)
 
@@ -35,6 +38,8 @@
 
 ## 用法
 
+### Windows 版
+
 双击 `JPG转UltraHDR.exe`，然后：
 
 - 把 JPEG 文件或整个文件夹**拖进窗口**
@@ -44,6 +49,15 @@
 
 输出默认写到源文件同目录，文件名加 `_hdr` 后缀：`DSC_0227.jpg` → `DSC_0227_hdr.jpg`。
 也可以把文件直接拖到 exe 图标上启动。
+
+### Android 版
+
+1. 打开 app，点 **添加图片** → 系统文件选择器里可以多选 JPEG
+2. 按需调整「转换设置」里的参数。滑块轻点即到位置，横向拖动连续调整；竖直滑动是滚动页面，不会误改数值
+3. 点 **开始转换**，每张图片下方会显示结果：分辨率、增益图尺寸、峰值倍数、文件大小
+4. 点 **保存到相册**，结果写入 `Pictures/JPG2UltraHDR`
+
+右上角的太阳/月亮按钮切换深色 / 浅色主题。详见 [android-app/README.md](android-app/README.md)。
 
 ## 参数
 
@@ -110,6 +124,8 @@ SOI
 
 ## 从源码构建
 
+### Windows 版
+
 需要 Rust 1.95 或更新的稳定版。
 
 ```bash
@@ -119,6 +135,17 @@ cargo build --release
 
 `.cargo/config.toml` 里给 MSVC 目标打开了 `+crt-static`，所以发布版不依赖 VCRUNTIME140.dll，
 拷到任何 Windows 10 / 11 机器上都能直接跑。
+
+### Android 版
+
+见 [android-app/README.md](android-app/README.md)。需要 JDK 21、Android SDK 35、
+NDK 27.3.13750724、`cargo-ndk`、rustup target `aarch64-linux-android`、Gradle 8.5，
+然后：
+
+```powershell
+cd android-app
+.\build-android.ps1 -Release
+```
 
 ## 附带工具
 
@@ -161,8 +188,26 @@ cargo run --release --bin p3_test -- src.jpg dst.jpg
 
 ## 技术栈
 
-Rust · eframe / egui 0.36 + modern-egui 0.2（GUI）· ultrajpeg 0.5.0-rc8（Ultra HDR 封装）·
-zune-jpeg 0.5（解码）· mozjpeg-rs 0.9（编码）
+| 部分 | 技术 |
+|---|---|
+| 转换内核（共用） | Rust · ultrajpeg 0.5.0-rc8（Ultra HDR 封装）· zune-jpeg 0.5（解码）· mozjpeg-rs 0.9（编码） |
+| Windows 界面 | eframe / egui 0.36 + modern-egui 0.2 |
+| Android 界面 | egui 0.35（含 `vendor/egui` 触摸补丁）+ egui-android-framework 0.4.0-alpha.4 |
+
+## 目录结构
+
+```
+src/               转换内核 + Windows 界面 + 开发工具
+  lib.rs           解码、增益图推导、Ultra HDR 封装（两个平台共用）
+  main.rs          Windows GUI
+  config.rs        设置持久化
+  bin/             诊断与小工具
+android-app/       Android 工程（独立 crate，依赖 ../ 的内核）
+  src/lib.rs       界面逻辑（M3）
+  src/design.rs    Material Design 3 组件库
+  android/         Gradle 工程
+  vendor/egui      打过触摸滚动补丁的 egui 0.35
+```
 
 ## 许可
 
