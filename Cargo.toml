@@ -1,0 +1,29 @@
+[package]
+name = "jpg2ultrahdr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Convert ordinary JPEG photos into Ultra HDR JPEG images"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ultrajpeg = "0.5.0-rc8"
+ultrahdr-core = "0.2"
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "links",
+    "__screenshot",
+] }
+modern-egui = "0.2"
+rfd = "0.18"
+rayon = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+anyhow = "1"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

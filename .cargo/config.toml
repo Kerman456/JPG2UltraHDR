@@ -1,0 +1,4 @@
+# 静态链接 MSVC 运行库，避免目标机器缺少 VCRUNTIME140.dll。
+# 不设置这个的话，Rust 默认用动态 CRT（/MD）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

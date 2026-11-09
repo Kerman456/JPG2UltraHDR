@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# 产生的转换结果
+*_hdr.jpg
