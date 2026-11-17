@@ -517,9 +517,14 @@ impl App {
             });
 
             ui.space_group();
-            slider_row_f32(ui, "提亮上限", &mut self.settings.max_boost, 1.0..=8.0, "×", 1);
-            slider_row_f32(ui, "提亮起点", &mut self.settings.knee, 0.0..=0.95, "", 2);
-            ui.metadata_label("越小则越多中间调参与提亮；上限 2–4 最自然");
+            ui.checkbox(&mut self.settings.auto_tone, "自动推断提亮参数");
+            if self.settings.auto_tone {
+                ui.metadata_label("按每张照片自身的亮度分布决定提亮起点与上限，逐张计算。");
+            } else {
+                slider_row_f32(ui, "提亮上限", &mut self.settings.max_boost, 1.0..=8.0, "×", 1);
+                slider_row_f32(ui, "提亮起点", &mut self.settings.knee, 0.0..=0.95, "", 2);
+                ui.metadata_label("越小则越多中间调参与提亮；上限 2–4 最自然");
+            }
         });
 
         ui.space_group();

@@ -1,5 +1,5 @@
 //! 验证脚本：转换一张样张，并检查生成的 Ultra HDR 是否可被正确回读。
-//! 用 `cargo run --bin verify -- <src.jpg> <dst.jpg> [max_boost]`。
+//! 用 `cargo run --bin verify -- <src.jpg> <dst.jpg> [max_boost|auto]`。
 
 use std::path::PathBuf;
 
@@ -11,13 +11,17 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let src: PathBuf = args.next().expect("缺少源文件").into();
     let dst: PathBuf = args.next().expect("缺少目标文件").into();
-    let max_boost: f32 = args
-        .next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3.0);
+    let mode = args.next().unwrap_or_else(|| "3.0".to_owned());
+    let auto_tone = mode.eq_ignore_ascii_case("auto");
+    let max_boost: f32 = if auto_tone {
+        3.0
+    } else {
+        mode.parse().unwrap_or(3.0)
+    };
 
     let settings = convert::Settings {
         max_boost,
+        auto_tone,
         ..Default::default()
     };
 
@@ -68,7 +72,7 @@ fn main() {
             / (data.len() - zero).max(1) as f64
     );
 
-    for boost in [1.0f32, 1.5, 2.0, max_boost] {
+    for boost in [1.0f32, 1.5, 2.0, report.peak_boost] {
         let hdr = decoded
             .reconstruct_hdr(boost, HdrOutputFormat::LinearFloat)
             .expect("重建 HDR 失败");

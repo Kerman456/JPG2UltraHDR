@@ -85,6 +85,7 @@ pub fn load() -> Persisted {
                 }
             }
             "progressive" => settings.progressive = parse_bool(value).unwrap_or(true),
+            "auto_tone" => settings.auto_tone = parse_bool(value).unwrap_or(true),
             "display_p3" => settings.to_display_p3 = parse_bool(value).unwrap_or(false),
             "keep_exif" => settings.keep_exif = parse_bool(value).unwrap_or(true),
             "out_dir" => {
@@ -143,6 +144,7 @@ pub fn render(persisted: &Persisted) -> String {
     out.push_str(&format!("primary_quality={}\n", s.primary_quality));
     out.push_str(&format!("gainmap_quality={}\n", s.gainmap_quality));
     out.push_str(&format!("scale={}\n", s.scale));
+    out.push_str(&format!("auto_tone={}\n", s.auto_tone));
     out.push_str(&format!("max_boost={}\n", s.max_boost));
     out.push_str(&format!("knee={}\n", s.knee));
     out.push_str(&format!("progressive={}\n", s.progressive));

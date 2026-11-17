@@ -24,6 +24,43 @@ use ultrajpeg::{
 /// ISO 21496-1 gain map offset (same value the reference implementation uses).
 const OFFSET: f32 = 1.0 / 64.0;
 
+// ---- automatic tone curve ------------------------------------------------
+//
+// A fixed knee/max_boost pair cannot suit every picture: a dim interior tops
+// out at a perceptual level around 0.55 while a sunlit landscape reaches 0.97,
+// so the same knee either drags most of the midtones into the boost or leaves
+// the highlights untouched.
+//
+// Instead of guessing two numbers, the rule pins the *result* and derives the
+// numbers from it:
+//
+//   * the brightest content of the picture (P99.9 of the perceptual level)
+//     should gain `AUTO_TARGET_STOPS` stops in the HDR rendering;
+//   * the gain map may never exceed `AUTO_BOOST_MAX`, which limits how steep
+//     the shoulder is allowed to be.
+//
+// Invert that limit and the knee falls out: the shoulder must still be able to
+// reach the target at the top of the picture, so the knee cannot sit *above*
+// `(P99.9 - r) / (1 - r)`, where `r` is the argument whose smoothstep equals the
+// fraction of the available boost the target needs. Taking the *lower* of that
+// bound and P95 keeps the shoulder clear of the bulk of the image.
+
+/// Gain (in stops) applied to the brightest content by the automatic curve.
+const AUTO_TARGET_STOPS: f32 = 1.5;
+/// Upper bound for the automatic peak gain; also caps the shoulder steepness.
+const AUTO_BOOST_MAX: f32 = 4.0;
+/// Lower bound so a picture with almost no range still gets a sane curve.
+const AUTO_BOOST_MIN: f32 = 1.5;
+/// The knee is never placed below this level: below it the curve would pull in
+/// midtones, which reads as a washed-out global brightening rather than as
+/// recovered highlight detail.
+const AUTO_KNEE_MIN: f32 = 0.40;
+/// ...and never above this, or the shoulder would sit on the brightest few
+/// pixels and recover nothing visible.
+const AUTO_KNEE_MAX: f32 = 0.92;
+/// How many pixels the histogram samples; larger than this gains nothing.
+const AUTO_SAMPLES: u64 = 250_000;
+
 /// Namespaces that mark a JPEG as already carrying a gain map.
 ///
 /// The Google *container* namespace is deliberately NOT in this list: motion
@@ -47,6 +84,10 @@ pub struct Settings {
     pub max_boost: f32,
     /// Perceptual luminance where the highlight expansion starts (0..1).
     pub knee: f32,
+    /// Derive [`Self::max_boost`] and [`Self::knee`] from each picture instead
+    /// of using the two values above. Keeps any picture from being pushed
+    /// either into the midtones or past its own highlights.
+    pub auto_tone: bool,
     /// Write a progressive JPEG.
     pub progressive: bool,
     /// Convert the primary from BT.709 to Display P3.
@@ -63,6 +104,7 @@ impl Default for Settings {
             scale: 2,
             max_boost: 3.0,
             knee: 0.55,
+            auto_tone: true,
             progressive: true,
             to_display_p3: false,
             keep_exif: true,
@@ -98,6 +140,146 @@ pub fn is_already_ultra_hdr(data: &[u8]) -> bool {
     ULTRA_HDR_MARKERS
         .iter()
         .any(|needle| data.windows(needle.len()).any(|w| w == *needle))
+}
+
+/// Resolved highlight expansion, either typed in by the user or derived from
+/// the picture by [`auto_tone`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToneParams {
+    pub knee: f32,
+    pub max_boost: f32,
+    /// Perceptual level of the brightest content (P99.9 of the histogram).
+    pub top_level: f32,
+    /// Stops the curve actually adds at [`Self::top_level`].
+    pub top_stops: f32,
+}
+
+/// Derive the highlight curve from the picture's own luminance histogram.
+///
+/// See the constants at the top of this module for the reasoning. The result is
+/// deterministic for a given picture, so converting the same file twice yields
+/// the same gain map.
+pub fn auto_tone(primary: &RawImage) -> ToneParams {
+    let (p95, p999) = top_percentiles(primary);
+
+    // P95 first: starting the shoulder above 95% of the picture keeps the
+    // expansion confined to the top of the range.
+    let reach = smoothstep_inv(need_t());
+    let mut knee = p95.min((p999 - reach) / (1.0 - reach));
+    knee = knee.clamp(AUTO_KNEE_MIN, AUTO_KNEE_MAX);
+    // Never let the shoulder start above the tip of the histogram.
+    knee = knee.min((p999 - 0.02).max(AUTO_KNEE_MIN));
+
+    let t = smoothstep((p999 - knee) / (1.0 - knee).max(1e-6));
+    // A picture whose brightest content still sits below the shoulder (a very
+    // dim, underexposed frame) has no highlight headroom to expand. Lifting its
+    // top few percent anyway would paint a bright patch into an almost black
+    // image, so leave it alone and emit an empty gain map.
+    if t <= 1e-4 {
+        return ToneParams {
+            knee,
+            max_boost: AUTO_BOOST_MIN,
+            top_level: p999,
+            top_stops: 0.0,
+        };
+    }
+
+    let target = 2f32.powf(AUTO_TARGET_STOPS);
+    let max_boost = (1.0 + (target - 1.0) / t).clamp(AUTO_BOOST_MIN, AUTO_BOOST_MAX);
+
+    ToneParams {
+        knee,
+        max_boost,
+        top_level: p999,
+        top_stops: (1.0 + (max_boost - 1.0) * t).log2(),
+    }
+}
+
+/// Fraction of the available boost that [`AUTO_TARGET_STOPS`] needs when the
+/// curve is capped at [`AUTO_BOOST_MAX`].
+fn need_t() -> f32 {
+    let target = 2f32.powf(AUTO_TARGET_STOPS);
+    ((target - 1.0) / (AUTO_BOOST_MAX - 1.0)).clamp(0.0, 1.0)
+}
+
+/// Solve `smoothstep(r) == need_t()` once; the result sets the lowest knee the
+/// capped curve can still reach the target from.
+fn smoothstep_inv(y: f32) -> f32 {
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if smoothstep(mid) < y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Perceptual levels at 95% and 99.9% of the picture, on the same axis the gain
+/// curve thresholds on.
+///
+/// The histogram is built from a strided sample: the percentiles only need the
+/// shape of the distribution, and a 20 MP photo would otherwise cost a full
+/// pass over 60 MB for the same answer.
+fn top_percentiles(primary: &RawImage) -> (f32, f32) {
+    let mut histogram = [0u32; 256];
+    let luma = luma_coefficients(primary.gamut);
+    let total = (primary.width as usize) * (primary.height as usize);
+    // 250k samples: a 20 MP picture is sampled every 80th pixel.
+    let step = (total / AUTO_SAMPLES as usize).max(1);
+    let stride = primary.stride as usize;
+
+    for index in (0..total).step_by(step) {
+        let y = index / primary.width as usize;
+        let x = index % primary.width as usize;
+        let offset = y * stride + x * 3;
+        let luminance = luma[0] * srgb_eotf(primary.data[offset] as f32 / 255.0)
+            + luma[1] * srgb_eotf(primary.data[offset + 1] as f32 / 255.0)
+            + luma[2] * srgb_eotf(primary.data[offset + 2] as f32 / 255.0);
+        let level = srgb_oetf(luminance.clamp(0.0, 1.0));
+        let bin = (level * 255.0).round().clamp(0.0, 255.0) as usize;
+        histogram[bin] += 1;
+    }
+
+    let count: u64 = histogram.iter().map(|&c| u64::from(c)).sum();
+    if count == 0 {
+        return (1.0, 1.0);
+    }
+    (percentile(&histogram, count, 0.95), percentile(&histogram, count, 0.999))
+}
+
+fn percentile(histogram: &[u32; 256], total: u64, fraction: f64) -> f32 {
+    let want = (fraction * total as f64).ceil() as u64;
+    let mut seen = 0u64;
+    for (bin, &count) in histogram.iter().enumerate() {
+        seen += u64::from(count);
+        if seen >= want {
+            return (bin as f32 + 0.5) / 255.0;
+        }
+    }
+    1.0
+}
+
+/// Pick the curve to encode: the user's numbers, or ones derived per picture.
+fn resolve_tone(primary: &RawImage, settings: &Settings) -> ToneParams {
+    if settings.auto_tone {
+        return auto_tone(primary);
+    }
+    let max_boost = settings.max_boost.clamp(1.0, 16.0);
+    ToneParams {
+        knee: settings.knee.clamp(0.0, 0.999),
+        max_boost,
+        // A manual curve is described by its own bounds, not by the picture.
+        top_level: 1.0,
+        top_stops: max_boost.log2(),
+    }
 }
 
 /// Everything needed from the source JPEG before re-encoding it.
@@ -197,7 +379,8 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
     let exif = if settings.keep_exif { source.exif } else { None };
 
     // ---- gain map --------------------------------------------------------
-    let (gain_image, gain_metadata) = build_gain_map(&primary, settings);
+    let tone = resolve_tone(&primary, settings);
+    let (gain_image, gain_metadata) = build_gain_map_with(&primary, settings.scale, tone);
     let (gain_width, gain_height) = (gain_image.width, gain_image.height);
     let peak_boost = gain_metadata.max_content_boost[0];
 
@@ -259,15 +442,26 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
 /// reproducing the curve lands on the intended brightness: midtones and
 /// shadows stay untouched, highlights expand up to `max_boost`.
 pub fn build_gain_map(primary: &RawImage, settings: &Settings) -> (RawImage, GainMapMetadata) {
+    let tone = resolve_tone(primary, settings);
+    build_gain_map_with(primary, settings.scale, tone)
+}
+
+/// [`build_gain_map`] with the curve given explicitly, for callers that already
+/// resolved it (or measured it, as the automatic path does).
+pub fn build_gain_map_with(
+    primary: &RawImage,
+    scale: u32,
+    tone: ToneParams,
+) -> (RawImage, GainMapMetadata) {
     let width = primary.width;
     let height = primary.height;
-    let scale = settings.scale.max(1);
+    let scale = scale.max(1);
     let gain_width = width.div_ceil(scale);
     let gain_height = height.div_ceil(scale);
 
-    let max_boost = settings.max_boost.clamp(1.0, 16.0);
+    let max_boost = tone.max_boost.clamp(1.0, 16.0);
     let log_max = max_boost.ln();
-    let knee = settings.knee.clamp(0.0, 0.999);
+    let knee = tone.knee.clamp(0.0, 0.999);
     let span = (1.0 - knee).max(1e-6);
     let luma = luma_coefficients(primary.gamut);
 

@@ -302,6 +302,7 @@ enum Msg {
     SetPrimaryQuality(u8),
     SetGainQuality(u8),
     SetScale(u32),
+    SetAutoTone(bool),
     SetMaxBoost(f32),
     SetKnee(f32),
     SetProgressive(bool),
@@ -533,6 +534,7 @@ impl Component for Root {
             Msg::SetPrimaryQuality(v) => self.settings.primary_quality = v,
             Msg::SetGainQuality(v) => self.settings.gainmap_quality = v,
             Msg::SetScale(v) => self.settings.scale = v,
+            Msg::SetAutoTone(v) => self.settings.auto_tone = v,
             Msg::SetMaxBoost(v) => self.settings.max_boost = v,
             Msg::SetKnee(v) => self.settings.knee = v,
             Msg::SetProgressive(v) => self.settings.progressive = v,
@@ -1023,20 +1025,34 @@ fn settings_card(ui: &mut egui::Ui, m: &M3, settings: &Settings, dispatch: &Disp
         dispatch.dispatch(Msg::SetGainQuality(gain_quality.round() as u8));
     }
 
-    let mut max_boost = settings.max_boost;
-    if slider(ui, m, "提亮上限", &mut max_boost, 1.0..=6.0, 1, "×") {
-        dispatch.dispatch(Msg::SetMaxBoost(max_boost));
+    let mut auto_tone = settings.auto_tone;
+    if switch(
+        ui,
+        m,
+        "auto_tone",
+        "自动推断提亮参数",
+        Some("按每张照片自身的亮度分布决定起点与上限"),
+        &mut auto_tone,
+    ) {
+        dispatch.dispatch(Msg::SetAutoTone(auto_tone));
     }
 
-    let mut knee = settings.knee;
-    if slider(ui, m, "提亮起点", &mut knee, 0.0..=0.95, 2, "") {
-        dispatch.dispatch(Msg::SetKnee(knee));
+    if !settings.auto_tone {
+        let mut max_boost = settings.max_boost;
+        if slider(ui, m, "提亮上限", &mut max_boost, 1.0..=6.0, 1, "×") {
+            dispatch.dispatch(Msg::SetMaxBoost(max_boost));
+        }
+
+        let mut knee = settings.knee;
+        if slider(ui, m, "提亮起点", &mut knee, 0.0..=0.95, 2, "") {
+            dispatch.dispatch(Msg::SetKnee(knee));
+        }
+        ui.label(
+            egui::RichText::new("越小则越多中间调参与提亮；上限 2–4 最自然")
+                .size(11.5)
+                .color(m.on_surface_variant),
+        );
     }
-    ui.label(
-        egui::RichText::new("越小则越多中间调参与提亮；上限 2–4 最自然")
-            .size(11.5)
-            .color(m.on_surface_variant),
-    );
 
     ui.add_space(14.0);
     ui.label(
