@@ -10,6 +10,7 @@
 //! 框架不提供文件选择与相册写入，这两件事通过 `jni_bridge` 调用
 //! `EguiActivity` 里的 Kotlin 静态方法完成。
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -18,7 +19,7 @@ use egui_android_framework::prelude::*;
 use egui_android_framework::runtime::{RuntimeConfig, RuntimeContext, UiNotifier};
 use egui_android_framework::ui::theme::{MaterialTheme, Theme};
 
-use jpg2ultrahdr::{Report, Settings, convert as convert_one, output_path};
+use jpg2ultrahdr::{Report, Settings, Stroke, convert as convert_one, output_path};
 
 mod design;
 use design::{
@@ -309,6 +310,24 @@ enum Msg {
     SetDisplayP3(bool),
     SetKeepExif(bool),
     Remove(usize),
+    /// 选中哪一张作为预览与绘制的对象。
+    Select(usize),
+    SetPainting(bool),
+    SetErasing(bool),
+    SetShowMask(bool),
+    SetBrushGain(f32),
+    SetBrushRadius(f32),
+    /// 一笔画完，把它提交进蒙版。
+    CommitStroke,
+    UndoStroke,
+    ClearPaint,
+}
+
+/// 屏幕上正在画的那一笔。`render` 拿到的是 `&self`，所以用内部可变性。
+struct PaintUi {
+    active: Option<Stroke>,
+    /// 画完待提交的一笔，由 `Msg::CommitStroke` 取走。
+    pending: Option<Stroke>,
 }
 
 struct Root {
@@ -320,6 +339,25 @@ struct Root {
     finished: usize,
     awaiting_pick: bool,
     gallery_saved: usize,
+
+    // ── 预览与绘制 ──
+    selected: usize,
+    painting: bool,
+    erasing: bool,
+    show_mask: bool,
+    brush_gain: f32,
+    brush_radius: f32,
+    /// 已解码的缩略图，key 是文件路径 + 尺寸，用来判断何时重新解码。
+    preview: RefCell<Option<Preview>>,
+    paint_ui: RefCell<PaintUi>,
+}
+
+struct Preview {
+    key: String,
+    /// `None` when decoding failed — remembered so we do not retry every frame.
+    texture: Option<egui::TextureHandle>,
+    /// 源图尺寸（不是缩略图尺寸），蒙版半径按宽度归一化要用它。
+    source: [u32; 2],
 }
 
 impl Root {
@@ -333,7 +371,64 @@ impl Root {
             finished: 0,
             awaiting_pick: false,
             gallery_saved: 0,
+            selected: 0,
+            painting: false,
+            erasing: false,
+            show_mask: true,
+            brush_gain: 1.0,
+            brush_radius: 0.06,
+            preview: RefCell::new(None),
+            paint_ui: RefCell::new(PaintUi {
+                active: None,
+                pending: None,
+            }),
         }
+    }
+
+    /// 把（可能失效的）预览纹理换成当前选中文件的缩略图。
+    fn ensure_preview(&self, ctx: &egui::Context) {
+        let Some(item) = self.items.get(self.selected) else {
+            *self.preview.borrow_mut() = None;
+            return;
+        };
+        let wanted = Self::preview_key(item);
+        if self
+            .preview
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.key == wanted)
+        {
+            return;
+        }
+
+        let decoded = jpg2ultrahdr::thumbnail_rgba(&item.path, 1080);
+        let entry = match decoded {
+            Ok((width, height, rgba)) => {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+                let texture =
+                    ctx.load_texture("paint_preview", image, egui::TextureOptions::LINEAR);
+                Preview {
+                    key: wanted,
+                    texture: Some(texture),
+                    source: [width, height],
+                }
+            }
+            Err(err) => {
+                log::warn!("缩略图解码失败：{err:#}");
+                // 记下失败，避免每帧重试同一个坏文件。
+                Preview {
+                    key: wanted,
+                    texture: None,
+                    source: [0, 0],
+                }
+            }
+        };
+        *self.preview.borrow_mut() = Some(entry);
+    }
+
+    fn preview_key(item: &Item) -> String {
+        item.path.display().to_string()
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
@@ -368,6 +463,208 @@ impl Root {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 预览 + 蒙版绘制。这是手机上唯一能「看到」照片的地方。
+    fn preview_card(&self, ui: &mut egui::Ui, m: &M3, dispatch: &Dispatcher<Msg>) {
+        let stroke_count = self.settings.paint.len();
+        section_title(ui, m, "增益蒙版", Some(&format!("已画 {stroke_count} 笔")));
+
+        let mut painting = self.painting;
+        if switch(
+            ui,
+            m,
+            "painting",
+            "手动画笔",
+            Some("在预览图上涂抹，画过的地方按笔刷强度提亮"),
+            &mut painting,
+        ) {
+            dispatch.dispatch(Msg::SetPainting(painting));
+        }
+
+        if self.painting {
+            ui.label(
+                egui::RichText::new("画笔已开启：手指在图上涂抹即可，页面滚动先关掉。")
+                    .size(11.5)
+                    .color(m.on_surface_variant),
+            );
+            ui.add_space(6.0);
+
+            let mut gain = self.brush_gain;
+            if slider(ui, m, "笔刷强度", &mut gain, 0.1..=1.0, 2, "") {
+                dispatch.dispatch(Msg::SetBrushGain(gain));
+            }
+            let mut radius = self.brush_radius;
+            if slider(ui, m, "笔刷半径", &mut radius, 0.01..=0.30, 2, "") {
+                dispatch.dispatch(Msg::SetBrushRadius(radius));
+            }
+
+            let mut erasing = self.erasing;
+            if switch(ui, m, "erasing", "橡皮擦", None, &mut erasing) {
+                dispatch.dispatch(Msg::SetErasing(erasing));
+            }
+            let mut show_mask = self.show_mask;
+            if switch(ui, m, "show_mask", "显示蒙版", None, &mut show_mask) {
+                dispatch.dispatch(Msg::SetShowMask(show_mask));
+            }
+            ui.add_space(4.0);
+        }
+
+        let preview = self.preview.borrow();
+        let Some(preview) = preview.as_ref() else {
+            ui.label(
+                egui::RichText::new("正在解码预览…")
+                    .size(12.0)
+                    .color(m.on_surface_variant),
+            );
+            return;
+        };
+        let Some(texture) = preview.texture.as_ref() else {
+            ui.label(
+                egui::RichText::new("这张图无法预览（可能不是普通 JPEG）")
+                    .size(12.0)
+                    .color(m.on_surface_variant),
+            );
+            return;
+        };
+
+        let available = ui.available_width();
+        let tex_size = texture.size_vec2();
+        let aspect = (tex_size.y / tex_size.x.max(1.0)).clamp(0.2, 4.0);
+        let height = (available * aspect).clamp(120.0, 420.0);
+        let sense = if self.painting {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(available, height), sense);
+
+        // 按比例塞进 rect，居中留白。
+        let scale = (rect.width() / tex_size.x.max(1.0))
+            .min(rect.height() / tex_size.y.max(1.0));
+        let shown = egui::vec2(tex_size.x * scale, tex_size.y * scale);
+        let fitted = egui::Rect::from_center_size(rect.center(), shown);
+
+        let painter = ui.painter();
+        painter.image(
+            texture.id(),
+            fitted,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+
+        let mut commit = false;
+        if self.painting {
+            let to_norm = |pos: egui::Pos2| -> [f32; 2] {
+                [
+                    ((pos.x - fitted.left()) / fitted.width().max(1.0)).clamp(0.0, 1.0),
+                    ((pos.y - fitted.top()) / fitted.height().max(1.0)).clamp(0.0, 1.0),
+                ]
+            };
+
+            let mut paint = self.paint_ui.borrow_mut();
+            let started = if response.drag_started() || response.clicked() {
+                response
+                    .interact_pointer_pos()
+                    .filter(|pos| fitted.contains(*pos))
+            } else {
+                None
+            };
+            if let Some(pos) = started {
+                paint.active = Some(Stroke::new(
+                    self.brush_gain,
+                    self.brush_radius,
+                    self.erasing,
+                    to_norm(pos),
+                ));
+            } else if response.dragged() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let point = to_norm(pos);
+                    match &mut paint.active {
+                        Some(stroke) => stroke.push(point),
+                        None => {
+                            paint.active = Some(Stroke::new(
+                                self.brush_gain,
+                                self.brush_radius,
+                                self.erasing,
+                                point,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if response.drag_stopped()
+                || response.clicked()
+                || ui.input(|i| !i.pointer.primary_down())
+            {
+                if let Some(stroke) = paint.active.take() {
+                    paint.pending = Some(stroke);
+                    commit = true;
+                }
+            }
+        } else {
+            self.paint_ui.borrow_mut().active = None;
+        }
+
+        // 蒙版叠加：黄=加亮、红=擦除。
+        if self.show_mask {
+            let painter = ui.painter_at(fitted);
+            let width_of = |stroke: &Stroke| (stroke.radius * fitted.width() * 2.0).max(3.0);
+            let active = self.paint_ui.borrow().active.clone();
+            let strokes = self
+                .settings
+                .paint
+                .strokes()
+                .iter()
+                .chain(active.as_ref().into_iter());
+            for stroke in strokes {
+                let color = if stroke.erase {
+                    egui::Color32::from_rgba_unmultiplied(240, 90, 90, 150)
+                } else {
+                    let alpha = (70.0 + 140.0 * stroke.gain).clamp(0.0, 255.0) as u8;
+                    egui::Color32::from_rgba_unmultiplied(255, 214, 120, alpha)
+                };
+                let width = width_of(stroke);
+                let points: Vec<egui::Pos2> = stroke
+                    .points
+                    .iter()
+                    .map(|p| {
+                        egui::pos2(
+                            fitted.left() + p[0] * fitted.width(),
+                            fitted.top() + p[1] * fitted.height(),
+                        )
+                    })
+                    .collect();
+                if points.len() == 1 {
+                    painter.circle_filled(points[0], width * 0.5, color);
+                } else if points.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        points,
+                        egui::epaint::PathStroke::new(width, color),
+                    ));
+                }
+            }
+        }
+
+        if commit {
+            dispatch.dispatch(Msg::CommitStroke);
+        }
+
+        ui.add_space(6.0);
+        let can_undo = stroke_count > 0;
+        if button(ui, m, "撤销上一笔", ButtonKind::Text, can_undo) {
+            dispatch.dispatch(Msg::UndoStroke);
+        }
+        if button(ui, m, "清空蒙版", ButtonKind::Text, can_undo) {
+            dispatch.dispatch(Msg::ClearPaint);
+        }
+        ui.label(
+            egui::RichText::new(format!("原图 {}×{}", preview.source[0], preview.source[1]))
+                .size(11.0)
+                .color(m.on_surface_variant),
+        );
     }
 }
 
@@ -473,8 +770,20 @@ impl Component for Root {
 
         // ── 主体 ────────────────────────────────────────────────────
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            // 画笔开启时关掉「拖动页面」手势，否则手指在预览图上滑动会
+            // 同时被 ScrollArea 拿走，笔画和滚动互相抢。
+            let scroll_source = if self.painting {
+                egui::containers::scroll_area::ScrollSource {
+                    drag: egui::containers::scroll_area::DragScroll::Never,
+                    ..Default::default()
+                }
+            } else {
+                egui::containers::scroll_area::ScrollSource::default()
+            };
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                .scroll_source(scroll_source)
                 .show(ui, |ui| {
                     ui.add_space(14.0);
 
@@ -489,9 +798,13 @@ impl Component for Root {
                                 Some(&format!("{} 张", self.items.len())),
                             );
                             for (index, item) in self.items.iter().enumerate() {
-                                file_row(ui, &m, index, item, dispatch);
+                                file_row(ui, &m, index, item, index == self.selected, dispatch);
                             }
                         });
+
+                        ui.add_space(12.0);
+                        self.ensure_preview(ui.ctx());
+                        card(ui, &m, false, |ui| self.preview_card(ui, &m, dispatch));
                     }
 
                     ui.add_space(12.0);
@@ -543,8 +856,49 @@ impl Component for Root {
             Msg::Remove(index) => {
                 if index < self.items.len() {
                     self.items.remove(index);
+                    if self.selected >= self.items.len() {
+                        self.selected = self.items.len().saturating_sub(1);
+                    }
                     self.notice = format!("还剩 {} 张图片", self.items.len());
                 }
+            }
+            Msg::Select(index) => {
+                if index < self.items.len() {
+                    self.selected = index;
+                    self.notice = format!("正在编辑第 {} 张的蒙版", index + 1);
+                }
+            }
+            Msg::SetPainting(v) => {
+                self.painting = v;
+                if !v {
+                    self.paint_ui.borrow_mut().active = None;
+                }
+            }
+            Msg::SetErasing(v) => self.erasing = v,
+            Msg::SetShowMask(v) => self.show_mask = v,
+            Msg::SetBrushGain(v) => self.brush_gain = v.clamp(0.05, 1.0),
+            Msg::SetBrushRadius(v) => self.brush_radius = v.clamp(0.002, 0.5),
+            Msg::CommitStroke => {
+                if let Some(stroke) = self.paint_ui.borrow_mut().pending.take() {
+                    let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
+                    layer.push(stroke);
+                    let count = self.settings.paint.len();
+                    self.notice = format!("已画 {count} 笔");
+                }
+            }
+            Msg::UndoStroke => {
+                let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
+                if layer.undo() {
+                    let count = self.settings.paint.len();
+                    self.notice = format!("已画 {count} 笔");
+                }
+            }
+            Msg::ClearPaint => {
+                let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
+                layer.clear();
+                self.paint_ui.borrow_mut().active = None;
+                self.paint_ui.borrow_mut().pending = None;
+                self.notice = "蒙版已清空".to_owned();
             }
         }
     }
@@ -888,16 +1242,32 @@ fn empty_state(ui: &mut egui::Ui, m: &M3) {
 }
 
 /// 单行文件条目：序号徽标 + 文件名 + 状态 + 移除按钮。
+///
+/// 点整行选中它作为蒙版编辑对象；右侧按钮只负责移除。
 fn file_row(
     ui: &mut egui::Ui,
     m: &M3,
     index: usize,
     item: &Item,
+    selected: bool,
     dispatch: &Dispatcher<Msg>,
 ) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::hover());
     let painter = ui.painter();
+
+    if selected {
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(12),
+            egui::Color32::from_rgba_unmultiplied(
+                m.primary.r(),
+                m.primary.g(),
+                m.primary.b(),
+                26,
+            ),
+        );
+    }
 
     if index > 0 {
         painter.line_segment(
@@ -992,6 +1362,17 @@ fn file_row(
     );
     if close_response.clicked() {
         dispatch.dispatch(Msg::Remove(index));
+    } else {
+        // 整行（除移除按钮外）都能点选。
+        let row = egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(close.left() - 4.0, rect.bottom()),
+        );
+        let row_response =
+            ui.interact(row, ui.id().with(("select", index)), egui::Sense::click());
+        if row_response.clicked() {
+            dispatch.dispatch(Msg::Select(index));
+        }
     }
 }
 

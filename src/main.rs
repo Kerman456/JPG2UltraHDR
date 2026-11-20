@@ -11,13 +11,19 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
-use jpg2ultrahdr::{Report, Settings, convert as convert_one, output_path};
+use jpg2ultrahdr::{
+    Report, Settings, Stroke as PaintStroke, convert as convert_one, output_path,
+};
 use modern_egui::theme::{self, UiButtons, UiMetrics, UiPanels, UiText, ui_ext::PanelVariant};
 
 mod config;
 
 /// 设置改动后最快多久写一次盘，避免拖滑块时每帧都碰磁盘。
 const WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 笔刷半径以图像宽度为单位，与内核里的约定一致。
+const BRUSH_RADIUS_RANGE: std::ops::RangeInclusive<f32> = 0.01..=0.30;
+const BRUSH_RADIUS_DEFAULT: f32 = 0.06;
 
 fn main() -> eframe::Result {
     // 支持把文件/文件夹拖到 exe 图标上直接打开。
@@ -136,6 +142,18 @@ struct App {
     saved_config: String,
     /// 上次写盘的时刻，用于限制拖滑块时的写盘频率。
     last_write: Option<std::time::Instant>,
+    /// 是否处于绘制模式：预览图上按下拖动即画一笔。
+    painting: bool,
+    /// 是否把已画的蒙版叠在预览图上，方便看清画在哪儿。
+    show_mask: bool,
+    /// 橡皮擦：擦掉已有覆盖，而不是再加一层。
+    erasing: bool,
+    /// 笔刷目标增益，0..1，与 `max_boost` 成比例。
+    brush_gain: f32,
+    /// 笔刷半径，以图像宽度为单位。
+    brush_radius: f32,
+    /// 正在拖动的这一笔；松开鼠标时提交进 `settings.paint`。
+    active_stroke: Option<PaintStroke>,
 }
 
 impl App {
@@ -161,6 +179,12 @@ impl App {
             // 窗口尺寸和主题也会被记住。
             saved_config: String::new(),
             last_write: None,
+            painting: false,
+            show_mask: true,
+            erasing: false,
+            brush_gain: 1.0,
+            brush_radius: BRUSH_RADIUS_DEFAULT,
+            active_stroke: None,
         }
     }
 
@@ -529,6 +553,46 @@ impl App {
 
         ui.space_group();
 
+        // —— 手动绘制增益蒙版 ——
+        let full = ui.available_width();
+        ui.card(|ui| {
+            ui.set_min_width(full - 30.0);
+            ui.card_title("绘制增益蒙版");
+            ui.space_group();
+
+            ui.checkbox(&mut self.painting, "开启画笔");
+            if self.painting {
+                ui.metadata_label("在预览图上按住拖动即可涂抹；画过的地方按笔刷强度提亮，没画的地方仍走自动曲线。");
+            } else {
+                ui.metadata_label("勾选后在预览图上手动涂抹，用于窗户、灯、天空这类局部高光。");
+            }
+
+            slider_row_f32(ui, "笔刷强度", &mut self.brush_gain, 0.1..=1.0, "", 2);
+            let mut radius = self.brush_radius;
+            slider_row_f32(ui, "笔刷半径", &mut radius, BRUSH_RADIUS_RANGE, "", 2);
+            self.brush_radius = radius;
+
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.erasing, "橡皮擦");
+                ui.checkbox(&mut self.show_mask, "显示蒙版");
+            });
+
+            ui.space_group();
+            ui.horizontal(|ui| {
+                let count = self.settings.paint.len();
+                ui.metadata_label(&format!("已画 {count} 笔"));
+                if ui.ghost_button("撤销").clicked() {
+                    Arc::make_mut(&mut self.settings.paint).undo();
+                }
+                if ui.ghost_button("清空").clicked() {
+                    self.active_stroke = None;
+                    Arc::make_mut(&mut self.settings.paint).clear();
+                }
+            });
+        });
+
+        ui.space_group();
+
         // —— 输出选项 ——
         let full = ui.available_width();
         ui.card(|ui| {
@@ -673,10 +737,15 @@ impl App {
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
-        match &self.preview {
-            Some(preview) => {
+        // 先把纹理信息取出来，后面要 &mut self 才能改蒙版。
+        let preview_info = self
+            .preview
+            .as_ref()
+            .map(|preview| (preview.texture.id(), preview.texture.size_vec2()));
+
+        match preview_info {
+            Some((texture_id, texture_size)) => {
                 let available = ui.available_size();
-                let texture_size = preview.texture.size_vec2();
                 let scale = (available.x / texture_size.x)
                     .min(available.y / texture_size.y)
                     .min(1.0)
@@ -689,24 +758,160 @@ impl App {
                 ui.add_space(pad_y.max(0.0));
                 ui.horizontal(|ui| {
                     ui.add_space(pad_x);
-                    ui.add(
-                        egui::Image::new(egui::load::SizedTexture::new(
-                            preview.texture.id(),
-                            shown,
-                        ))
-                        .corner_radius(6.0),
+                    // 画笔模式要接住拖动，否则只当普通静态图。
+                    let sense = if self.painting {
+                        egui::Sense::click_and_drag()
+                    } else {
+                        egui::Sense::hover()
+                    };
+                    let response = ui.add(
+                        egui::Image::new(egui::load::SizedTexture::new(texture_id, shown))
+                            .corner_radius(6.0)
+                            .sense(sense),
                     );
+                    self.handle_painting(ui, &response);
                 });
             }
             None => {
                 ui.add_space(40.0);
+                let error = self.preview_error.clone();
                 ui.vertical_centered(|ui| {
-                    if let Some(err) = &self.preview_error {
+                    if let Some(err) = &error {
                         ui.colored_label(ui.visuals().error_fg_color, err.as_str());
                     } else {
                         ui.muted_label("选择左侧文件以预览");
                     }
                 });
+            }
+        }
+    }
+
+    /// 把预览图上的指针拖动翻译成一笔笔画，并把已画的内容叠在上面。
+    fn handle_painting(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        let rect = response.rect;
+        if rect.width() <= 1.0 || rect.height() <= 1.0 {
+            return;
+        }
+
+        if self.painting {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            // 归一化坐标：与内核里的蒙版约定一致（0..1 覆盖整幅图）。
+            let to_norm = |pos: egui::Pos2| {
+                [
+                    ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),
+                    ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0),
+                ]
+            };
+
+            if response.drag_started() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    self.active_stroke = Some(PaintStroke::new(
+                        self.brush_gain,
+                        self.brush_radius,
+                        self.erasing,
+                        to_norm(pos),
+                    ));
+                }
+            } else if response.dragged() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let point = to_norm(pos);
+                    match self.active_stroke.as_mut() {
+                        Some(stroke) => stroke.push(point),
+                        None => {
+                            self.active_stroke = Some(PaintStroke::new(
+                                self.brush_gain,
+                                self.brush_radius,
+                                self.erasing,
+                                point,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 单击不拖动也算落一个点，方便点状加亮。
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let dab = PaintStroke::new(
+                        self.brush_gain,
+                        self.brush_radius,
+                        self.erasing,
+                        to_norm(pos),
+                    );
+                    Arc::make_mut(&mut self.settings.paint).push(dab);
+                }
+            }
+        }
+
+        // 松手（或指针离开窗口）时提交这一笔。
+        if response.drag_stopped() {
+            if let Some(stroke) = self.active_stroke.take() {
+                Arc::make_mut(&mut self.settings.paint).push(stroke);
+            }
+        }
+
+        if self.show_mask {
+            self.draw_mask_overlay(ui, rect);
+        }
+    }
+
+    /// 用折线把笔画画在预览图上：这只是给眼睛看的，真正的增益图由内核按
+    /// 同一组归一化坐标算出来。
+    fn draw_mask_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let strokes = self
+            .settings
+            .paint
+            .strokes()
+            .iter()
+            .chain(self.active_stroke.iter());
+
+        for stroke in strokes {
+            let width = (stroke.radius * rect.width() * 2.0).max(2.0);
+            let color = if stroke.erase {
+                egui::Color32::from_rgba_unmultiplied(240, 90, 90, 150)
+            } else {
+                // 增益越高越亮，让蒙版的强度一眼可读。
+                let alpha = (70.0 + 140.0 * stroke.gain) as u8;
+                egui::Color32::from_rgba_unmultiplied(255, 214, 120, alpha)
+            };
+            let points: Vec<egui::Pos2> = stroke
+                .points
+                .iter()
+                .map(|p| {
+                    egui::pos2(
+                        rect.min.x + p[0] * rect.width(),
+                        rect.min.y + p[1] * rect.height(),
+                    )
+                })
+                .collect();
+            match points.len() {
+                0 => {}
+                1 => {
+                    painter.circle_filled(points[0], width * 0.5, color);
+                }
+                _ => {
+                    painter.add(egui::Shape::line(
+                        points,
+                        egui::epaint::PathStroke::new(width, color),
+                    ));
+                }
+            }
+        }
+
+        // 笔刷光标：鼠标在图上时画一个圈，标出落笔范围。
+        if self.painting {
+            if let Some(pos) = ui.ctx().pointer_hover_pos() {
+                if rect.contains(pos) {
+                    let radius = self.brush_radius * rect.width();
+                    let color = ui.visuals().strong_text_color();
+                    painter.circle_stroke(pos, radius, egui::Stroke::new(1.5, color));
+                    painter.circle_stroke(
+                        pos,
+                        radius + 1.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(120)),
+                    );
+                }
             }
         }
     }
