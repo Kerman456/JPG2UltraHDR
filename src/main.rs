@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
-use jpg2ultrahdr::{PreviewFrame, Report, Settings, convert as convert_one, output_path};
+use jpg2ultrahdr::{
+    OutputFormat, PreviewFrame, Report, Settings, convert as convert_one, output_path,
+};
 use modern_egui::theme::{self, UiButtons, UiMetrics, UiPanels, UiText, ui_ext::PanelVariant};
 
 mod config;
@@ -397,7 +399,7 @@ impl App {
                                 break;
                             };
                             let _ = tx.send(Event::Started(*slot));
-                            let dst = output_path(path, out_dir.as_deref());
+                            let dst = output_path(path, out_dir.as_deref(), settings.format);
                             let result =
                                 convert_one(path, &dst, settings).map_err(|e| format!("{e:#}"));
                             let _ = tx.send(Event::Done(*slot, result));
@@ -533,6 +535,36 @@ impl App {
                         }
                     });
             });
+
+            let before_format = self.settings.format;
+            ui.horizontal(|ui| {
+                ui.add_sized([92.0, 18.0], egui::Label::new("输出格式"));
+                egui::ComboBox::from_id_salt("format")
+                    .selected_text(format_label(self.settings.format))
+                    .width(ui.available_width() - 12.0)
+                    .show_ui(ui, |ui| {
+                        for format in [OutputFormat::Jpeg, OutputFormat::Heic] {
+                            ui.selectable_value(
+                                &mut self.settings.format,
+                                format,
+                                format_label(format),
+                            );
+                        }
+                    });
+            });
+            if self.settings.format != before_format {
+                // The extension changes with the format, so every finished file
+                // is now stale — same treatment as editing a mask.
+                self.mark_dirty();
+            }
+            match self.settings.format {
+                OutputFormat::Jpeg => {
+                    ui.metadata_label("通用格式，所有看图软件都能打开，SDR 屏幕上原样显示。");
+                }
+                OutputFormat::Heic => {
+                    ui.metadata_label("走 HEVC 编码，体积约为 JPG 的 60%，20 MP 需要 10–15 秒。");
+                }
+            }
 
             ui.space_group();
             ui.checkbox(&mut self.settings.auto_tone, "自动推断提亮参数");
@@ -1034,6 +1066,13 @@ fn scale_label(scale: u32) -> &'static str {    match scale {
         1 => "全分辨率（最大，最清晰）",
         2 => "半分辨率（推荐）",
         _ => "四分之一（最小）",
+    }
+}
+
+fn format_label(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Jpeg => "JPG（通用）",
+        OutputFormat::Heic => "HEIC（更小，较慢）",
     }
 }
 

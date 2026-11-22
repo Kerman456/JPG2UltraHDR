@@ -10,7 +10,7 @@ Android 应用。转换内核与 Windows 版完全共用（仓库根目录的 `s
 APK 只有 **arm64-v8a**（现代手机都是这个架构），系统要求 **Android 10（API 29）或更高**。
 
 ```bash
-adb install -r JPG2UltraHDR-0.1.4-arm64.apk
+adb install -r JPG2UltraHDR-0.1.5-arm64.apk
 ```
 
 也可以直接把 APK 传到手机上，用文件管理器点开安装（需要允许「安装未知来源应用」）。
@@ -172,7 +172,8 @@ w        = 形状覆盖度 × 不透明度
 - **共用**：仓库根目录的 `src/lib.rs`（解码、增益图、封装、EXIF/ICC 处理全在这里）。
 - **各自实现**：界面。Windows 用 eframe + modern-egui，Android 用 egui-android-framework。
 - 桌面依赖通过 `[target.'cfg(not(target_os = "android"))'.dependencies]` 隔离，
-  所以同一个内核 crate 能同时为两边编译。
+  所以同一个内核 crate 能同时为两边编译。HEIC 输出（`src/heic.rs` + heifer 依赖）就在这层隔离里，
+  安卓编译时根本不会拉进来，`convert()` 里的 HEIC 分支会返回「此版本不支持 HEIC 输出」。
 
 ## 从源码构建
 
@@ -194,7 +195,7 @@ rustup target `aarch64-linux-android`、Gradle 8.5。
 .\build-android.ps1 -Release -GradlePath "C:\gradle\bin\gradle.bat"
 ```
 
-产物：`android\app\build\outputs\apk\release\JPG2UltraHDR-0.1.4-arm64.apk`
+产物：`android\app\build\outputs\apk\release\JPG2UltraHDR-0.1.5-arm64.apk`
 
 手动分步：
 
@@ -214,6 +215,8 @@ gradle assembleRelease
 - 手机上 2000 万像素一张约需 150 MB 内存，所以并行数限制在 1–4 之间。
 - 预览图按长边 1080 px 解码显示（用于定位涂抹位置），不是全分辨率。
 - 蒙版是全局一份，不能给不同图片各存一套；坐标归一化让它对整批图同位生效。
+- 不支持 **HEIC 输出**。Windows 版可以选 HEIC，靠的是纯 Rust 的 HEVC 编码器，arm64 上比 x64 更慢
+  （2000 万像素一张要十几秒），所以这里没有开放。配置文件里即使写着 `format=heic` 也会退回 JPG。
 - 手机壁纸/相册类 App 里能否看到 HDR 效果取决于系统是否支持 Ultra HDR 显示；
   Android 14+ 的部分机型可正常显示。
 - 应用包名 `com.kerman456.jpg2ultrahdr`，但 Activity 类必须留在

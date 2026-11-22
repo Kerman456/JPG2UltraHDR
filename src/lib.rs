@@ -11,6 +11,14 @@
 
 pub mod mask;
 
+// The HEIC writer pulls in a pure-Rust HEVC encoder, which is a desktop-only
+// dependency: on arm64 Android it would add roughly 9x the encode time of the
+// JPEG path for a format the share sheet barely uses. `Settings::format` still
+// exists there so the struct is shared, and `convert` reports a clear error
+// instead of silently falling back.
+#[cfg(not(target_os = "android"))]
+pub mod heic;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -76,6 +84,52 @@ const ULTRA_HDR_MARKERS: [&[u8]; 2] = [
     b"urn:iso:std:iso:ts:21496:-1",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// Ultra HDR JPEG: SDR primary + gain map in an MPF container. Universally
+    /// readable, including by the SDR fallback of every viewer.
+    #[default]
+    Jpeg,
+    /// ISO 21496-1 HEIC: HEVC-coded primary + gain map plane. Smaller at equal
+    /// quality, but roughly nine times slower to encode and unreadable by
+    /// software that predates HEIF.
+    Heic,
+}
+
+impl OutputFormat {
+    /// File extension for [`output_path`], without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Heic => "heic",
+        }
+    }
+
+    /// Same as [`Self::extension`] with the leading dot, for UI text.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Jpeg => ".jpg",
+            Self::Heic => ".heic",
+        }
+    }
+
+    /// Stable token for the on-disk settings file.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
+            Self::Heic => "heic",
+        }
+    }
+
+    pub fn from_code(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "jpeg" | "jpg" => Some(Self::Jpeg),
+            "heic" | "heif" => Some(Self::Heic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Quality of the SDR primary JPEG (1..=100).
@@ -103,6 +157,9 @@ pub struct Settings {
     /// `Arc` because every batch worker clones the whole [`Settings`], and a
     /// long editing session would otherwise be copied per file.
     pub masks: Arc<MaskStack>,
+    /// Container written by [`convert`]. Both formats carry the same gain map;
+    /// they differ in codec and in what software can open the result.
+    pub format: OutputFormat,
 }
 
 impl Default for Settings {
@@ -118,6 +175,7 @@ impl Default for Settings {
             to_display_p3: false,
             keep_exif: true,
             masks: Arc::new(MaskStack::default()),
+            format: OutputFormat::Jpeg,
         }
     }
 }
@@ -694,29 +752,29 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
     let (gain_width, gain_height) = (gain_image.width, gain_image.height);
     let peak_boost = gain_metadata.max_content_boost[0];
 
-    let options = EncodeOptions {
-        quality: settings.primary_quality.clamp(1, 100),
-        progressive: settings.progressive,
-        compression: CompressionEffort::Balanced,
-        chroma_subsampling: ChromaSubsampling::Yuv420,
-        primary_metadata: PrimaryMetadata { color, exif },
-        ultra_hdr_metadata_emission: Default::default(),
-        gain_map: Some(GainMapBundle {
-            image: gain_image,
-            metadata: gain_metadata,
-            quality: settings.gainmap_quality.clamp(1, 100),
-            progressive: false,
-            compression: CompressionEffort::Balanced,
-        }),
+    let output = match settings.format {
+        OutputFormat::Jpeg => encode_jpeg(
+            &primary,
+            gain_image,
+            gain_metadata,
+            color,
+            exif,
+            settings,
+        )?,
+        OutputFormat::Heic => {
+            // The HEIC writer takes the ICC separately, so pull it out before
+            // `color` would be consumed by the JPEG options.
+            let icc = color.icc_profile.clone();
+            encode_heic(
+                &primary,
+                &gain_image,
+                &gain_metadata,
+                exif.as_deref(),
+                icc.as_deref(),
+                settings,
+            )?
+        }
     };
-
-    let output = ultrajpeg::encode(&primary, &options).with_context(|| "编码 Ultra HDR 失败")?;
-
-    // Cheap sanity check: the container must advertise a gain map.
-    let check = ultrajpeg::inspect(&output).with_context(|| "回读校验失败")?;
-    if check.gain_map_jpeg_len.is_none() {
-        bail!("输出文件缺少增益图");
-    }
 
     if let Some(parent) = dst.parent() {
         if !parent.as_os_str().is_empty() {
@@ -735,6 +793,75 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
         peak_boost,
         gamut: gamut_name(gamut),
     })
+}
+
+/// Write the Ultra HDR JPEG: SDR primary + gain map in one MPF container.
+fn encode_jpeg(
+    primary: &RawImage,
+    gain_image: RawImage,
+    gain_metadata: GainMapMetadata,
+    color: ColorMetadata,
+    exif: Option<Vec<u8>>,
+    settings: &Settings,
+) -> Result<Vec<u8>> {
+    let options = EncodeOptions {
+        quality: settings.primary_quality.clamp(1, 100),
+        progressive: settings.progressive,
+        compression: CompressionEffort::Balanced,
+        chroma_subsampling: ChromaSubsampling::Yuv420,
+        primary_metadata: PrimaryMetadata { color, exif },
+        ultra_hdr_metadata_emission: Default::default(),
+        gain_map: Some(GainMapBundle {
+            image: gain_image,
+            metadata: gain_metadata,
+            quality: settings.gainmap_quality.clamp(1, 100),
+            progressive: false,
+            compression: CompressionEffort::Balanced,
+        }),
+    };
+
+    let output = ultrajpeg::encode(primary, &options).with_context(|| "编码 Ultra HDR 失败")?;
+
+    // Cheap sanity check: the container must advertise a gain map.
+    let check = ultrajpeg::inspect(&output).with_context(|| "回读校验失败")?;
+    if check.gain_map_jpeg_len.is_none() {
+        bail!("输出文件缺少增益图");
+    }
+    Ok(output)
+}
+
+/// Write the ISO 21496-1 HEIC, reusing the gain map the JPEG path would embed.
+#[cfg(not(target_os = "android"))]
+fn encode_heic(
+    primary: &RawImage,
+    gain_image: &RawImage,
+    gain_metadata: &GainMapMetadata,
+    exif: Option<&[u8]>,
+    icc: Option<&[u8]>,
+    settings: &Settings,
+) -> Result<Vec<u8>> {
+    heic::encode(
+        primary,
+        gain_image,
+        gain_metadata,
+        settings.primary_quality,
+        exif,
+        icc,
+    )
+    .with_context(|| "编码 HEIC 失败")
+}
+
+/// Android builds ship without the HEVC encoder; say so instead of pretending.
+#[cfg(target_os = "android")]
+fn encode_heic(
+    _primary: &RawImage,
+    _gain_image: &RawImage,
+    _gain_metadata: &GainMapMetadata,
+    _exif: Option<&[u8]>,
+    _icc: Option<&[u8]>,
+    _settings: &Settings,
+) -> Result<Vec<u8>> {
+    bail!("此版本不支持 HEIC 输出，请改用 JPG")
 }
 
 /// Build a single-channel gain map plus matching ISO 21496-1 metadata.
@@ -884,13 +1011,17 @@ fn convert_primary_gamut(image: &mut RawImage, from: ColorGamut, to: ColorGamut)
     });
 }
 
-/// `photo.jpg` -> `photo_hdr.jpg`, either beside the source or in `out_dir`.
-pub fn output_path(src: &Path, out_dir: Option<&Path>) -> std::path::PathBuf {
+/// `photo.jpg` -> `photo_hdr.jpg` (or `photo_hdr.heic`), either beside the
+/// source or in `out_dir`.
+///
+/// The extension follows the requested [`OutputFormat`]; writing HEVC bytes into
+/// a `.jpg` name would make half the viewers refuse it.
+pub fn output_path(src: &Path, out_dir: Option<&Path>, format: OutputFormat) -> std::path::PathBuf {
     let stem = src
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".to_owned());
-    let name = format!("{stem}_hdr.jpg");
+    let name = format!("{stem}_hdr.{}", format.extension());
     match out_dir {
         Some(dir) => dir.join(name),
         None => src.with_file_name(name),

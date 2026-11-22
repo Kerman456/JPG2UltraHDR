@@ -256,7 +256,7 @@ fn worker_loop(cmd_rx: mpsc::Receiver<Cmd>, evt_tx: mpsc::Sender<Event>, wake_tx
 fn run_one(src: &Path, settings: &Settings) -> Result<Summary, String> {
     log::info!("run_one: 开始 {src:?}");
     std::fs::create_dir_all(out_dir()).map_err(|e| format!("创建输出目录失败：{e}"))?;
-    let dst = output_path(src, Some(out_dir()));
+    let dst = output_path(src, Some(out_dir()), settings.format);
     log::info!("run_one: 输出到 {dst:?}");
 
     let report: Report =

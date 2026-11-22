@@ -13,9 +13,9 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 
 不想自己编译的话，直接下打包好的版本：
 
-> **Windows**：[JPG2UltraHDR-v0.1.4-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.4/JPG2UltraHDR-v0.1.4-windows-x64.zip) — 解压即用，含主程序、说明文档和两个检查工具。
+> **Windows**：[JPG2UltraHDR-v0.1.5-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.5/JPG2UltraHDR-v0.1.5-windows-x64.zip) — 解压即用，含主程序、说明文档和两个检查工具。
 >
-> **Android**：[JPG2UltraHDR-0.1.4-arm64.apk](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.4/JPG2UltraHDR-0.1.4-arm64.apk) — 直接装，需要 Android 10 或更高。
+> **Android**：[JPG2UltraHDR-0.1.5-arm64.apk](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.5/JPG2UltraHDR-0.1.5-arm64.apk) — 直接装，需要 Android 10 或更高。
 
 ![深色主题](docs/screenshot-dark.png)
 
@@ -32,6 +32,7 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 - 实时预览：左侧点选文件，中间直接看原图
 - 三档增益图分辨率（全 / 半 / 四分之一），体积与画质可权衡
 - 可调提亮上限与提亮起点，也可以交给**自动推断**：按每张照片自身的亮度分布逐张算
+- **可输出 HEIC**（Windows 版）：走 HEVC 编码，体积约为 JPG 的 60%，代价是慢 4–5 倍
 - **五类局部蒙版**：线性渐变、径向渐变、画笔、亮度范围、颜色范围。每个蒙版有自己的提亮上限与起点，可以叠加、减去、取交集
 - **蒙版编辑器**：预览图上拖一下建蒙版，滚轮调羽化，画笔实时看得到笔触；面板里能改名、反转、调不透明度、切换跟随全局
 - **HDR 模拟预览**：按当前蒙版与提亮参数模拟 HDR 观感，导出前就能判断效果
@@ -55,6 +56,9 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 输出默认写到源文件同目录，文件名加 `_hdr` 后缀：`DSC_0227.jpg` → `DSC_0227_hdr.jpg`。
 也可以把文件直接拖到 exe 图标上启动。
 
+想要更小的文件，可以在「输出格式」里选 **HEIC**，得到 `DSC_0227_hdr.heic` —— 但会比 JPG 慢 4–5 倍，
+20 MP 的一张大约 6–7 秒。
+
 ### Android 版
 
 1. 打开 app，点 **添加图片** → 系统文件选择器里可以多选 JPEG
@@ -74,6 +78,7 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 | 主图质量 | 92 | SDR 主图 JPEG 编码质量 |
 | 增益图质量 | 90 | 增益图 JPEG 编码质量 |
 | 增益图分辨率 | 半分辨率 | 全 / 半 / 四分之一。半分辨率在体积与画质间最平衡 |
+| 输出格式 | JPG | JPG / HEIC。HEIC 体积约为 JPG 的 60%，但慢 4–5 倍，且仅 Windows 版支持 |
 | 提亮上限 | 3.0× | HDR 显示时高光最亮可达 SDR 的多少倍。2–4 最自然，8 以上会明显失真 |
 | 提亮起点 | 0.55 | 从哪个亮度开始参与提亮。越小则越多中间调被提亮 |
 | 自动推断提亮参数 | 开 | 按每张照片自身的亮度分布算出上面两个值，逐张计算 |
@@ -177,6 +182,8 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 
 ## 输出文件结构
 
+默认输出是 Ultra HDR JPEG（SDR 主图 + 增益图，靠 MPF 拼在同一个文件里）：
+
 ```
 SOI
  ├ APP0   JFIF
@@ -188,6 +195,23 @@ SOI
  ├ DQT/SOF/DHT/SOS…  SDR 主图（真正的画面）
  └ 增益图 JPEG（半分辨率、单通道灰度）
 ```
+
+### HEIC 输出
+
+选 HEIC 时改用另一条通路：SDR 主图和 HDR 画面一起交给 [heifer](https://crates.io/crates/heifer)
+（纯 Rust 的 HEVC 编码器），由它写成 ISO 21496-1 的 `tmap` 增益图项：
+
+```
+ftyp   brand = heic
+meta   hdlr / pitm / iloc / iinf / iref / grpl / iprp
+       ├ hvc1 × N   主图，按 512×512 网格分块编码
+       └ map        增益图项（tmap 指向主图）
+mdat   压缩后的 HEVC 码流
+```
+
+我们先把 `HDR = srgb_eotf(SDR) × gain` 逐像素算好再交出去 —— 这样每通道的 HDR/SDR 比值恒等于
+`gain`，heifer 从比值反推出来的增益图和我们自己算的完全一致，蒙版的影响原样保留。实测回读比对：
+平均相对误差 1.5%，P50 0.46%，P99 17.7%（误差来自 HEVC 对增益图的量化，不是公式偏差）。
 
 ## 兼容性
 
@@ -201,6 +225,9 @@ SOI
 - 已经在高光处削顶到 255 的区域，提亮后仍然是纯色块。
 - 转换会重新编码主图，因此与原图有约 1–2/255 的平均像素差（JPEG 重编码损失）。想进一步减小可把主图质量调到 96–100。
 - 目前只处理 JPEG 输入；PNG / HEIC / RAW 会先提示失败。
+- HEIC 输出有两个固定限制（heifer 决定的，绕不过去）：增益图一律写成**半分辨率**，所以「增益图分辨率」
+  选全尺寸或四分之一时会被采样到半尺寸；编码速度比 JPG 慢 4–5 倍。HEIC 也只在 Windows 版提供，
+  安卓版即使配置文件里写着 `format=heic` 也会退回 JPG 并提示。
 
 ## 从源码构建
 
@@ -255,6 +282,9 @@ cargo run --release --bin paint_regress -- "D:\Photos\0425\照片\未命名导�
 
 # 自动推断参数核对：逐张打印算出来的起点与上限
 cargo run --release --bin tone_probe -- "D:\Photos\0425\照片\未命名导出"
+
+# HEIC 保真自检：编码后回读，比对增益图、蒙版穿透与重建误差
+cargo run --release --bin heic_test -- src.jpg
 ```
 
 ## 实现说明
@@ -275,11 +305,25 @@ cargo run --release --bin tone_probe -- "D:\Photos\0425\照片\未命名导出"
 而且需要先构造一张浮点 HDR 图（每像素 8–16 字节）。这里改为直接按同样的公式
 逐块算出 8 位单通道增益图，既能把提亮上限开放给用户，内存占用也只有增益图本身的大小。
 
+### 为什么 HEIC 用 heifer 而不是 libultrahdr
+
+Google 的 libultrahdr 从 2.0.0（2026-08）才开始支持 HEIF 输出，而且那条规定很硬：
+`lib\src\ultrahdr_api.cpp` 里写着「heif/avif encoding is supported only with raw intents」——
+它只接受原始像素，让你自己算好的增益图进不去。我们的蒙版正是在增益图上做文章，
+这条路直接堵死。另外 libultrahdr 2.x 的 HEIF 默认要 `UHDR_BUILD_DEPS=ON` 静态编一份
+打过 ISO 21496-1 补丁的 libheif 进去，Windows 上还得配 x265 / nasm。
+
+`heifer` 是纯 Rust、零 C 依赖（`cargo tree` 里没有 `cc` / `-sys` / `bindgen` / `cmake`），
+自己实现了 HEVC 编码和 ISO 21496-1 的写入。它虽然没有「直接塞一张增益图」的 API，
+但从 `(SDR, HDR)` 反推的公式是确定的，我们把 HDR 按 `linear(SDR) × gain` 构造好交过去，
+存进去的就是同一张图。
+
 ## 技术栈
 
 | 部分 | 技术 |
 |---|---|
 | 转换内核（共用） | Rust · ultrajpeg 0.5.0-rc8（Ultra HDR 封装）· zune-jpeg 0.5（解码）· mozjpeg-rs 0.9（编码） |
+| HEIC 输出（仅 Windows） | heifer 0.5（纯 Rust HEVC 编码 + ISO 21496-1） |
 | Windows 界面 | eframe / egui 0.36 + modern-egui 0.2 |
 | Android 界面 | egui 0.35（含 `vendor/egui` 触摸补丁）+ egui-android-framework 0.4.0-alpha.4 |
 
@@ -288,12 +332,16 @@ cargo run --release --bin tone_probe -- "D:\Photos\0425\照片\未命名导出"
 ```
 src/               转换内核 + Windows 界面 + 开发工具
   lib.rs           解码、增益图推导、Ultra HDR 封装（两个平台共用）
+  mask.rs          五类蒙版的形状、权重与合成
+  heic.rs          HEIC 输出（heifer，仅桌面端）
+  editor.rs        Windows 蒙版编辑器
   main.rs          Windows GUI
   config.rs        设置持久化
   bin/             诊断与小工具
 android-app/       Android 工程（独立 crate，依赖 ../ 的内核）
   src/lib.rs       界面逻辑（M3）
   src/design.rs    Material Design 3 组件库
+  src/mask_ui.rs   蒙版编辑器
   android/         Gradle 工程
   vendor/egui      打过触摸滚动补丁的 egui 0.35
 ```

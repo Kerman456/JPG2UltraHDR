@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use jpg2ultrahdr::{Settings, convert, is_already_ultra_hdr, output_path};
+use jpg2ultrahdr::{OutputFormat, Settings, convert, is_already_ultra_hdr, output_path};
 
 fn make_jpeg(path: &Path, w: u32, h: u32, mode: &str) {
     let img = match mode {
@@ -100,11 +100,17 @@ fn main() {
         }
     }
 
-    // 输出命名
-    let out = output_path(Path::new(r"D:\x\photo.JPG"), None);
+    // 输出命名：扩展名必须跟着输出格式走
+    let out = output_path(Path::new(r"D:\x\photo.JPG"), None, OutputFormat::Jpeg);
     println!(
         "{} 输出名 = {}",
         if out.ends_with("photo_hdr.jpg") { "✓" } else { "✗" },
+        out.display()
+    );
+    let out = output_path(Path::new(r"D:\x\photo.JPG"), None, OutputFormat::Heic);
+    println!(
+        "{} HEIC 输出名 = {}",
+        if out.ends_with("photo_hdr.heic") { "✓" } else { "✗" },
         out.display()
     );
 

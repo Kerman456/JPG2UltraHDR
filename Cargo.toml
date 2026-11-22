@@ -1,6 +1,6 @@
 [package]
 name = "jpg2ultrahdr"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.95"
 description = "Convert ordinary JPEG photos into Ultra HDR JPEG images"
@@ -25,6 +25,9 @@ eframe = { version = "0.36", default-features = false, features = [
 modern-egui = "0.2"
 rfd = "0.18"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+# HEIC 输出：纯 Rust 的 HEVC 编码器 + ISO 21496-1 增益图，无需 cmake / libheif。
+# 只在桌面端启用 —— arm64 手机上 HEVC 编码比 x64 更慢，暂不提供。
+heifer = { version = "0.5", default-features = false, features = ["encoder"] }
 
 [profile.release]
 opt-level = 3

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use jpg2ultrahdr::{MaskStack, Settings};
+use jpg2ultrahdr::{MaskStack, OutputFormat, Settings};
 
 /// 需要跨会话保留的全部状态。
 pub struct Persisted {
@@ -102,6 +102,11 @@ pub fn load() -> Persisted {
                 }
             }
             "display_p3" => settings.to_display_p3 = parse_bool(value).unwrap_or(false),
+            "format" => {
+                if let Some(format) = OutputFormat::from_code(value) {
+                    settings.format = format;
+                }
+            }
             "keep_exif" => settings.keep_exif = parse_bool(value).unwrap_or(true),
             "out_dir" => {
                 let path = PathBuf::from(value);
@@ -171,6 +176,7 @@ pub fn render(persisted: &Persisted) -> String {
     }
     out.push_str(&format!("max_boost={}\n", s.max_boost));
     out.push_str(&format!("knee={}\n", s.knee));
+    out.push_str(&format!("format={}\n", s.format.code()));
     out.push_str(&format!("progressive={}\n", s.progressive));
     out.push_str(&format!("display_p3={}\n", s.to_display_p3));
     out.push_str(&format!("keep_exif={}\n", s.keep_exif));
