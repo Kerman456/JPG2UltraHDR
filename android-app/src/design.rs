@@ -169,10 +169,25 @@ impl ButtonKind {
 }
 
 /// M3 按钮。返回是否被点击。
+///
+/// 默认铺满所在行的可用宽度；横向并排多个按钮时用 [`button_w`] 指定宽度，
+/// 否则第一个按钮就吃掉整行、后面的全被挤出屏幕。
 pub fn button(ui: &mut Ui, m: &M3, label: impl Into<String>, kind: ButtonKind, enabled: bool) -> bool {
+    let width = ui.available_width();
+    button_w(ui, m, label, kind, enabled, width)
+}
+
+/// 指定宽度的 M3 按钮。
+pub fn button_w(
+    ui: &mut Ui,
+    m: &M3,
+    label: impl Into<String>,
+    kind: ButtonKind,
+    enabled: bool,
+    width: f32,
+) -> bool {
     let label = label.into();
     let height = 52.0;
-    let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     let (bg, fg, border) = kind.colors(m, enabled);
 
@@ -205,6 +220,27 @@ pub fn button(ui: &mut Ui, m: &M3, label: impl Into<String>, kind: ButtonKind, e
     );
 
     enabled && response.clicked()
+}
+
+/// 一行 N 个等宽按钮。间距 8 px，宽度按所在行的可用宽度均分。
+pub fn button_row(ui: &mut Ui, m: &M3, items: &[(String, ButtonKind, bool)]) -> Option<usize> {
+    let count = items.len();
+    if count == 0 {
+        return None;
+    }
+    let gap = 8.0;
+    let total = ui.available_width();
+    let width = ((total - gap * (count as f32 - 1.0)) / count as f32).max(24.0);
+    let mut hit = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (index, (label, kind, enabled)) in items.iter().enumerate() {
+            if button_w(ui, m, label.clone(), *kind, *enabled, width) {
+                hit = Some(index);
+            }
+        }
+    });
+    hit
 }
 
 /// M3 卡片：圆角 20、填充 surface container，可选描边。

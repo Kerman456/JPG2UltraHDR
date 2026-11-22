@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use jpg2ultrahdr::{PaintLayer, Settings, Stroke, build_gain_map, convert};
+use jpg2ultrahdr::{
+    BrushMask, BrushStroke, MaskLayer, MaskShape, MaskStack, Settings, build_gain_map, convert,
+};
 
 /// 0.1.2 发布版对 DSC_0227 自动模式的输出哈希。蒙版为空时必须仍然命中它。
 const AUTO_HASH_0227: &str = "AD71D39AC5D610CEB6175535E1BD3062556C975BC0B8A69471B9AC22A022BC9F";
@@ -30,12 +32,20 @@ fn main() {
     }
 
     // 一个明显的斜向笔画 + 一个点，覆盖"折线"和"单点"两种情况。
-    let mut layer = PaintLayer::default();
-    let mut slash = Stroke::new(0.9, 0.05, false, [0.15, 0.20]);
+    let mut mask = BrushMask::default();
+    let mut slash = BrushStroke::new(0.05, 1.0, 1.0, false, [0.15, 0.20]);
     slash.push([0.35, 0.45]);
     slash.push([0.55, 0.70]);
-    layer.push(slash);
-    layer.push(Stroke::new(1.0, 0.04, false, [0.80, 0.30]));
+    mask.push(slash);
+    mask.push(BrushStroke::new(0.04, 1.0, 1.0, false, [0.80, 0.30]));
+
+    let mut layer = MaskLayer::new("回归", MaskShape::Brush(mask));
+    // 跟随全局的蒙版不会改变增益图，这里给它一条自己的曲线。上限必须留在全局
+    // 曲线之内：一旦抬高 `capacity`，整张增益图的对数刻度都会变，所有像素都会
+    // 变化，"只有画过的地方变了"就无法断言了。
+    layer.follow_base = false;
+    layer.knee = 0.0;
+    layer.max_boost = 1.5;
 
     let empty = Settings {
         auto_tone: true,
@@ -43,7 +53,11 @@ fn main() {
     };
     let painted = Settings {
         auto_tone: true,
-        paint: Arc::new(layer.clone()),
+        masks: Arc::new({
+            let mut stack = MaskStack::default();
+            stack.push(layer);
+            stack
+        }),
         ..Default::default()
     };
 

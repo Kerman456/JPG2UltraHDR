@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use jpg2ultrahdr::{PaintLayer, Settings};
+use jpg2ultrahdr::{MaskStack, Settings};
 
 /// 需要跨会话保留的全部状态。
 pub struct Persisted {
@@ -18,6 +18,8 @@ pub struct Persisted {
     /// 上次退出时的窗口逻辑尺寸（像素）。最大化时记录的是还原后的尺寸。
     pub window_size: Option<(f32, f32)>,
     pub maximized: bool,
+    /// 蒙版面板当前选中的图层。`0` 表示栈为空或用户没选。
+    pub selected_layer: usize,
 }
 
 impl Default for Persisted {
@@ -28,6 +30,7 @@ impl Default for Persisted {
             dark: true,
             window_size: None,
             maximized: false,
+            selected_layer: 0,
         }
     }
 }
@@ -87,9 +90,15 @@ pub fn load() -> Persisted {
             }
             "progressive" => settings.progressive = parse_bool(value).unwrap_or(true),
             "auto_tone" => settings.auto_tone = parse_bool(value).unwrap_or(true),
+            "masks" => {
+                if let Some(stack) = Arc::get_mut(&mut settings.masks) {
+                    *stack = MaskStack::decode(value);
+                }
+            }
+            // 0.1.3 及更早的一整段笔画，读进来后升级成一个画笔图层。
             "paint" => {
-                if let Some(layer) = Arc::get_mut(&mut settings.paint) {
-                    *layer = PaintLayer::decode(value);
+                if let Some(stack) = Arc::get_mut(&mut settings.masks) {
+                    *stack = MaskStack::from_legacy_paint(value);
                 }
             }
             "display_p3" => settings.to_display_p3 = parse_bool(value).unwrap_or(false),
@@ -119,6 +128,11 @@ pub fn load() -> Persisted {
                 }
             }
             "maximized" => persisted.maximized = parse_bool(value).unwrap_or(false),
+            "selected_layer" => {
+                if let Some(v) = parse_u8(value) {
+                    persisted.selected_layer = usize::from(v);
+                }
+            }
             _ => {}
         }
     }
@@ -151,9 +165,9 @@ pub fn render(persisted: &Persisted) -> String {
     out.push_str(&format!("gainmap_quality={}\n", s.gainmap_quality));
     out.push_str(&format!("scale={}\n", s.scale));
     out.push_str(&format!("auto_tone={}\n", s.auto_tone));
-    // 只在实际画过东西时写这一行：空蒙版不占配置体积，旧配置也能正常读回。
-    if !s.paint.is_empty() {
-        out.push_str(&format!("paint={}\n", s.paint.encode()));
+    // 只在有图层时写这一行：空栈不占配置体积，旧配置也能正常读回。
+    if !s.masks.is_empty() {
+        out.push_str(&format!("masks={}\n", s.masks.encode()));
     }
     out.push_str(&format!("max_boost={}\n", s.max_boost));
     out.push_str(&format!("knee={}\n", s.knee));
@@ -162,6 +176,9 @@ pub fn render(persisted: &Persisted) -> String {
     out.push_str(&format!("keep_exif={}\n", s.keep_exif));
     out.push_str(&format!("dark={}\n", persisted.dark));
     out.push_str(&format!("maximized={}\n", persisted.maximized));
+    if !persisted.settings.masks.is_empty() {
+        out.push_str(&format!("selected_layer={}\n", persisted.selected_layer));
+    }
     if let Some((width, height)) = persisted.window_size {
         out.push_str(&format!("window_width={width:.0}\n"));
         out.push_str(&format!("window_height={height:.0}\n"));

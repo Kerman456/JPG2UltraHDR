@@ -19,13 +19,18 @@ use egui_android_framework::prelude::*;
 use egui_android_framework::runtime::{RuntimeConfig, RuntimeContext, UiNotifier};
 use egui_android_framework::ui::theme::{MaterialTheme, Theme};
 
-use jpg2ultrahdr::{Report, Settings, Stroke, convert as convert_one, output_path};
+use jpg2ultrahdr::{
+    MaskCombine, MaskShape, MaskStack, PreviewFrame, Report, Settings, ToneParams,
+    convert as convert_one, output_path,
+};
 
 mod design;
+mod mask_ui;
 use design::{
-    ButtonKind, M3, button, card, linear_progress, section_title, segmented, slider, switch,
+    ButtonKind, M3, button, card, linear_progress, mix, section_title, segmented, slider, switch,
     top_bar,
 };
+use mask_ui::{MaskUi, Overlay, Tool, combine_label};
 
 // ─── 全局：由 android_main 写入，供 App::create 使用 ──────────────────
 
@@ -312,22 +317,40 @@ enum Msg {
     Remove(usize),
     /// 选中哪一张作为预览与绘制的对象。
     Select(usize),
-    SetPainting(bool),
-    SetErasing(bool),
-    SetShowMask(bool),
-    SetBrushGain(f32),
-    SetBrushRadius(f32),
-    /// 一笔画完，把它提交进蒙版。
-    CommitStroke,
-    UndoStroke,
-    ClearPaint,
-}
 
-/// 屏幕上正在画的那一笔。`render` 拿到的是 `&self`，所以用内部可变性。
-struct PaintUi {
-    active: Option<Stroke>,
-    /// 画完待提交的一笔，由 `Msg::CommitStroke` 取走。
-    pending: Option<Stroke>,
+    // ── 蒙版编辑器 ──
+    SetTool(u8),
+    SetOverlay(u32),
+    SetSimulate(bool),
+    SetExposure(f32),
+    /// 拖拽结束，把草稿层提交进蒙版栈。
+    CommitDraft,
+    CancelDraft,
+    SelectLayer(usize),
+    RemoveLayer(usize),
+    MoveLayer(usize),
+    ToggleLayer(usize),
+    CycleCombine(usize),
+    ToggleInvert(usize),
+    ToggleFollowBase(usize),
+    SetOpacity(usize, f32),
+    SetLayerBoost(usize, f32),
+    SetLayerKnee(usize, f32),
+    SetFeather(usize, f32),
+    SetBrushRadius(f32),
+    SetBrushHardness(f32),
+    SetBrushFlow(f32),
+    SetBrushErase(bool),
+    UndoStroke,
+    ClearBrush,
+    /// 亮度蒙版的三个参数：下限、上限、过渡。
+    SetLuma(usize, f32, f32, f32),
+    /// 颜色蒙版的四个参数：色相、容差、最低饱和、过渡。
+    SetHue(usize, f32, f32, f32, f32),
+    /// 开始给某一层改名；文本本身存在编辑器里（`Msg` 要 `Copy`）。
+    BeginRename(usize),
+    /// 改名输入框失去焦点或按下回车。
+    CommitRename,
 }
 
 struct Root {
@@ -340,24 +363,18 @@ struct Root {
     awaiting_pick: bool,
     gallery_saved: usize,
 
-    // ── 预览与绘制 ──
+    // ── 预览与蒙版 ──
     selected: usize,
-    painting: bool,
-    erasing: bool,
-    show_mask: bool,
-    brush_gain: f32,
-    brush_radius: f32,
-    /// 已解码的缩略图，key 是文件路径 + 尺寸，用来判断何时重新解码。
-    preview: RefCell<Option<Preview>>,
-    paint_ui: RefCell<PaintUi>,
+    layer_selected: usize,
+    /// 已解码的低分辨率副本，蒙版几何与叠加层都基于它。
+    frame: RefCell<Option<FrameEntry>>,
+    editor: RefCell<MaskUi>,
 }
 
-struct Preview {
+/// 缓存的一份预览帧，`key` 是文件路径，用来判断何时需要重新解码。
+struct FrameEntry {
     key: String,
-    /// `None` when decoding failed — remembered so we do not retry every frame.
-    texture: Option<egui::TextureHandle>,
-    /// 源图尺寸（不是缩略图尺寸），蒙版半径按宽度归一化要用它。
-    source: [u32; 2],
+    frame: PreviewFrame,
 }
 
 impl Root {
@@ -372,63 +389,72 @@ impl Root {
             awaiting_pick: false,
             gallery_saved: 0,
             selected: 0,
-            painting: false,
-            erasing: false,
-            show_mask: true,
-            brush_gain: 1.0,
-            brush_radius: 0.06,
-            preview: RefCell::new(None),
-            paint_ui: RefCell::new(PaintUi {
-                active: None,
-                pending: None,
-            }),
+            layer_selected: 0,
+            frame: RefCell::new(None),
+            editor: RefCell::new(MaskUi::default()),
         }
     }
 
-    /// 把（可能失效的）预览纹理换成当前选中文件的缩略图。
-    fn ensure_preview(&self, ctx: &egui::Context) {
+    /// 把（可能失效的）预览帧换成当前选中文件的缩略图。
+    fn ensure_frame(&self) {
         let Some(item) = self.items.get(self.selected) else {
-            *self.preview.borrow_mut() = None;
+            let mut slot = self.frame.borrow_mut();
+            if slot.is_some() {
+                *slot = None;
+                self.editor.borrow_mut().reset();
+            }
             return;
         };
-        let wanted = Self::preview_key(item);
+        let wanted = item.path.display().to_string();
         if self
-            .preview
+            .frame
             .borrow()
             .as_ref()
-            .is_some_and(|p| p.key == wanted)
+            .is_some_and(|entry| entry.key == wanted)
         {
             return;
         }
-
-        let decoded = jpg2ultrahdr::thumbnail_rgba(&item.path, 1080);
-        let entry = match decoded {
-            Ok((width, height, rgba)) => {
-                let image =
-                    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
-                let texture =
-                    ctx.load_texture("paint_preview", image, egui::TextureOptions::LINEAR);
-                Preview {
-                    key: wanted,
-                    texture: Some(texture),
-                    source: [width, height],
-                }
-            }
+        // 换图时草稿层属于上一张，必须丢掉，否则会画到新图上。
+        self.editor.borrow_mut().reset();
+        let entry = match PreviewFrame::load(&item.path, 1080) {
+            Ok(frame) => Some(FrameEntry {
+                key: wanted,
+                frame,
+            }),
             Err(err) => {
-                log::warn!("缩略图解码失败：{err:#}");
-                // 记下失败，避免每帧重试同一个坏文件。
-                Preview {
-                    key: wanted,
-                    texture: None,
-                    source: [0, 0],
-                }
+                log::warn!("预览帧解码失败：{err:#}");
+                None
             }
         };
-        *self.preview.borrow_mut() = Some(entry);
+        *self.frame.borrow_mut() = entry;
     }
 
-    fn preview_key(item: &Item) -> String {
-        item.path.display().to_string()
+    /// 编辑器要用的提亮曲线：自动模式按这张缩略图的分位算，
+    /// 结果与全分辨率一致到滑块精度以内。
+    fn current_tone(&self, frame: &PreviewFrame) -> ToneParams {
+        let mut tone = if self.settings.auto_tone {
+            frame.tone()
+        } else {
+            ToneParams {
+                knee: self.settings.knee,
+                max_boost: self.settings.max_boost,
+                top_level: 1.0,
+                top_stops: self.settings.max_boost.log2(),
+            }
+        };
+        let wanted = self.settings.masks.capacity(tone);
+        if wanted > tone.max_boost {
+            tone.max_boost = wanted;
+            tone.top_stops = tone.max_boost.log2();
+        }
+        tone
+    }
+
+
+    /// 蒙版栈在 `Arc` 里（转换时每个 worker 都 clone 一份 Settings），
+    /// 编辑前要先拿到独占引用。
+    fn masks_mut(&mut self) -> &mut MaskStack {
+        std::sync::Arc::make_mut(&mut self.settings.masks)
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
@@ -466,52 +492,13 @@ impl Root {
     }
 
     /// 预览 + 蒙版绘制。这是手机上唯一能「看到」照片的地方。
+    ///
+    /// 画布用的是 1080 px 的缩略副本，但蒙版的几何全部按 0..1 归一化保存，
+    /// 所以在这里画的位置就是导出时全分辨率图上生效的位置。
     fn preview_card(&self, ui: &mut egui::Ui, m: &M3, dispatch: &Dispatcher<Msg>) {
-        let stroke_count = self.settings.paint.len();
-        section_title(ui, m, "增益蒙版", Some(&format!("已画 {stroke_count} 笔")));
-
-        let mut painting = self.painting;
-        if switch(
-            ui,
-            m,
-            "painting",
-            "手动画笔",
-            Some("在预览图上涂抹，画过的地方按笔刷强度提亮"),
-            &mut painting,
-        ) {
-            dispatch.dispatch(Msg::SetPainting(painting));
-        }
-
-        if self.painting {
-            ui.label(
-                egui::RichText::new("画笔已开启：手指在图上涂抹即可，页面滚动先关掉。")
-                    .size(11.5)
-                    .color(m.on_surface_variant),
-            );
-            ui.add_space(6.0);
-
-            let mut gain = self.brush_gain;
-            if slider(ui, m, "笔刷强度", &mut gain, 0.1..=1.0, 2, "") {
-                dispatch.dispatch(Msg::SetBrushGain(gain));
-            }
-            let mut radius = self.brush_radius;
-            if slider(ui, m, "笔刷半径", &mut radius, 0.01..=0.30, 2, "") {
-                dispatch.dispatch(Msg::SetBrushRadius(radius));
-            }
-
-            let mut erasing = self.erasing;
-            if switch(ui, m, "erasing", "橡皮擦", None, &mut erasing) {
-                dispatch.dispatch(Msg::SetErasing(erasing));
-            }
-            let mut show_mask = self.show_mask;
-            if switch(ui, m, "show_mask", "显示蒙版", None, &mut show_mask) {
-                dispatch.dispatch(Msg::SetShowMask(show_mask));
-            }
-            ui.add_space(4.0);
-        }
-
-        let preview = self.preview.borrow();
-        let Some(preview) = preview.as_ref() else {
+        let frame_ref = self.frame.borrow();
+        let Some(entry) = frame_ref.as_ref() else {
+            section_title(ui, m, "蒙版", None);
             ui.label(
                 egui::RichText::new("正在解码预览…")
                     .size(12.0)
@@ -519,152 +506,615 @@ impl Root {
             );
             return;
         };
-        let Some(texture) = preview.texture.as_ref() else {
-            ui.label(
-                egui::RichText::new("这张图无法预览（可能不是普通 JPEG）")
-                    .size(12.0)
-                    .color(m.on_surface_variant),
-            );
-            return;
-        };
+        let frame = &entry.frame;
+        let tone = self.current_tone(frame);
+        let mut editor = self.editor.borrow_mut();
 
-        let available = ui.available_width();
-        let tex_size = texture.size_vec2();
-        let aspect = (tex_size.y / tex_size.x.max(1.0)).clamp(0.2, 4.0);
-        let height = (available * aspect).clamp(120.0, 420.0);
-        let sense = if self.painting {
-            egui::Sense::click_and_drag()
-        } else {
-            egui::Sense::hover()
-        };
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(available, height), sense);
-
-        // 按比例塞进 rect，居中留白。
-        let scale = (rect.width() / tex_size.x.max(1.0))
-            .min(rect.height() / tex_size.y.max(1.0));
-        let shown = egui::vec2(tex_size.x * scale, tex_size.y * scale);
-        let fitted = egui::Rect::from_center_size(rect.center(), shown);
-
-        let painter = ui.painter();
-        painter.image(
-            texture.id(),
-            fitted,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
+        editor.ensure_texture(
+            ui.ctx(),
+            frame,
+            &self.settings.masks,
+            tone,
+            self.layer_selected,
         );
 
-        let mut commit = false;
-        if self.painting {
-            let to_norm = |pos: egui::Pos2| -> [f32; 2] {
-                [
-                    ((pos.x - fitted.left()) / fitted.width().max(1.0)).clamp(0.0, 1.0),
-                    ((pos.y - fitted.top()) / fitted.height().max(1.0)).clamp(0.0, 1.0),
-                ]
-            };
+        // ── 工具条 ──────────────────────────────────────────────────
+        section_title(
+            ui,
+            m,
+            "蒙版",
+            Some(&format!("{} 个", self.settings.masks.len())),
+        );
 
-            let mut paint = self.paint_ui.borrow_mut();
-            let started = if response.drag_started() || response.clicked() {
-                response
-                    .interact_pointer_pos()
-                    .filter(|pos| fitted.contains(*pos))
-            } else {
-                None
-            };
-            if let Some(pos) = started {
-                paint.active = Some(Stroke::new(
-                    self.brush_gain,
-                    self.brush_radius,
-                    self.erasing,
-                    to_norm(pos),
-                ));
-            } else if response.dragged() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let point = to_norm(pos);
-                    match &mut paint.active {
-                        Some(stroke) => stroke.push(point),
-                        None => {
-                            paint.active = Some(Stroke::new(
-                                self.brush_gain,
-                                self.brush_radius,
-                                self.erasing,
-                                point,
-                            ));
-                        }
+        let mut scroll = egui::ScrollArea::horizontal().id_salt("mask_tools");
+        scroll = scroll.auto_shrink([false, true]);
+        scroll.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for tool in Tool::ALL {
+                    let active = editor.tool == tool;
+                    let text_color = if active { m.on_primary } else { m.on_surface_variant };
+                    let galley = ui.painter().layout_no_wrap(
+                        tool.label().to_owned(),
+                        egui::FontId::proportional(12.5),
+                        text_color,
+                    );
+                    let size = egui::vec2(galley.size().x + 22.0, 34.0);
+                    let (rect, response) =
+                        ui.allocate_exact_size(size, egui::Sense::click());
+                    let bg = if active {
+                        m.primary
+                    } else if response.hovered() {
+                        m.surface_variant
+                    } else {
+                        m.surface_container_highest
+                    };
+                    let origin = rect.center() - galley.size() / 2.0;
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 17.0, bg);
+                    painter.galley(origin, galley, text_color);
+                    if response.clicked() {
+                        dispatch.dispatch(Msg::SetTool(tool.index()));
+                    }
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(editor.tool.hint())
+                .size(11.5)
+                .color(m.on_surface_variant),
+        );
+        ui.add_space(6.0);
+
+        // ── 画布 ────────────────────────────────────────────────────
+        let available = ui.available_width();
+        let aspect = (frame.height as f32 / frame.width.max(1) as f32).clamp(0.2, 4.0);
+        let height = (available * aspect).clamp(140.0, 420.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(available, height), egui::Sense::click_and_drag());
+
+        let tex_size = egui::vec2(frame.width as f32, frame.height as f32);
+        let scale = (rect.width() / tex_size.x).min(rect.height() / tex_size.y);
+        let fitted = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(tex_size.x * scale, tex_size.y * scale),
+        );
+
+        let painter = ui.painter();
+        painter.rect_filled(rect, 12.0, m.surface_container_highest);
+        match editor.texture_id() {
+            Some(id) => {
+                painter.image(
+                    id,
+                    fitted,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            None => {
+                painter.text(
+                    fitted.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "这张图无法预览",
+                    egui::FontId::proportional(13.0),
+                    m.on_surface_variant,
+                );
+            }
+        }
+
+        let to_norm = |pos: egui::Pos2| -> [f32; 2] {
+            [
+                ((pos.x - fitted.left()) / fitted.width().max(1.0)).clamp(0.0, 1.0),
+                ((pos.y - fitted.top()) / fitted.height().max(1.0)).clamp(0.0, 1.0),
+            ]
+        };
+        let sample = |point: [f32; 2]| -> (f32, [u8; 3]) {
+            let x = ((point[0] * frame.width as f32) as u32).min(frame.width.saturating_sub(1));
+            let y = ((point[1] * frame.height as f32) as u32).min(frame.height.saturating_sub(1));
+            let offset = (y as usize * frame.width as usize + x as usize) * 3;
+            let rgb = [
+                frame.rgb[offset],
+                frame.rgb[offset + 1],
+                frame.rgb[offset + 2],
+            ];
+            (frame.level_at(x as usize, y as usize), rgb)
+        };
+
+        // 双指捏合：画笔时改笔刷粗细，其余工具改当前蒙版的羽化。
+        let (zoom, touching) = ui.input(|i| (i.zoom_delta(), i.any_touches()));
+        if touching && (zoom - 1.0).abs() > 0.01 {
+            if editor.tool == Tool::Brush {
+                editor.brush_radius = (editor.brush_radius * zoom).clamp(0.005, 0.5);
+            } else if let Some(layer) = self.settings.masks.layers().get(self.layer_selected) {
+                let next = (layer.shape.feather() * zoom).clamp(0.0, 1.0);
+                dispatch.dispatch(Msg::SetFeather(self.layer_selected, next));
+            }
+        }
+
+        let mut commit = false;
+
+        // 手势判定必须读原始指针状态，不能看 `response.dragged()`。
+        //
+        // 画布在 ScrollArea 里，手机上手指一落，ScrollArea 的触摸拖动
+        // （`DragScroll::OnTouch`）就把这条手势认领走，`response` 再也不会
+        // 进入 dragged 状态 —— 于是线性/径向蒙版的终点永远停在起点，权重
+        // 恒为 0（列表里能看到「1 个」，画面上却什么都没有）。
+        // 这里和 design.rs 的 slider 用同一套办法：按下点落在画布里才认这条手势。
+        let (origin, latest, down, delta) = ui.input(|i| {
+            (
+                i.pointer.press_origin(),
+                i.pointer.latest_pos(),
+                i.pointer.primary_down(),
+                i.pointer.delta(),
+            )
+        });
+        let delta_norm = egui::vec2(
+            delta.x / fitted.width().max(1.0),
+            delta.y / fitted.height().max(1.0),
+        );
+
+        if down {
+            if let (Some(from), Some(pos)) = (origin, latest) {
+                if fitted.contains(from) {
+                    if !editor.is_dragging() {
+                        let point = to_norm(from);
+                        let (level, rgb) = sample(point);
+                        editor.begin(point, level, rgb, tone, self.settings.masks.len() + 1);
+                        // 起手就落在画布上，立刻把终点推到位（轻点也能建蒙版）。
+                        editor.drag_to(to_norm(pos), point);
+                    } else {
+                        let point = to_norm(pos);
+                        let from = [
+                            (point[0] - delta_norm.x).clamp(0.0, 1.0),
+                            (point[1] - delta_norm.y).clamp(0.0, 1.0),
+                        ];
+                        editor.drag_to(point, from);
                     }
                 }
             }
-
-            if response.drag_stopped()
-                || response.clicked()
-                || ui.input(|i| !i.pointer.primary_down())
-            {
-                if let Some(stroke) = paint.active.take() {
-                    paint.pending = Some(stroke);
-                    commit = true;
-                }
-            }
-        } else {
-            self.paint_ui.borrow_mut().active = None;
+        } else if editor.is_dragging() {
+            // 手指抬起：指针已经没有 latest_pos，用上一帧位置收尾。
+            let point = latest.map(to_norm).unwrap_or([0.5, 0.5]);
+            // 最后一段位移经常和抬手落在同一批事件里，这一帧不再走上面的
+            // drag_to，线性/径向的终点就停在上一次采样处 —— 快速横划时看起来
+            // 像「画了个点」。收尾前先把终点推到位。
+            editor.drag_to(point, point);
+            editor.finish(point);
+            commit = true;
+        }
+        if down {
+            // 手指按住期间主动要求重绘，否则空闲时框架的 repaint_delay 是
+            // 无限大，移动事件攒到最后才处理，采样点会稀疏。
+            ui.ctx().request_repaint();
         }
 
-        // 蒙版叠加：黄=加亮、红=擦除。
-        if self.show_mask {
-            let painter = ui.painter_at(fitted);
-            let width_of = |stroke: &Stroke| (stroke.radius * fitted.width() * 2.0).max(3.0);
-            let active = self.paint_ui.borrow().active.clone();
-            let strokes = self
-                .settings
-                .paint
-                .strokes()
-                .iter()
-                .chain(active.as_ref().into_iter());
-            for stroke in strokes {
-                let color = if stroke.erase {
-                    egui::Color32::from_rgba_unmultiplied(240, 90, 90, 150)
-                } else {
-                    let alpha = (70.0 + 140.0 * stroke.gain).clamp(0.0, 255.0) as u8;
-                    egui::Color32::from_rgba_unmultiplied(255, 214, 120, alpha)
-                };
-                let width = width_of(stroke);
-                let points: Vec<egui::Pos2> = stroke
-                    .points
-                    .iter()
-                    .map(|p| {
-                        egui::pos2(
-                            fitted.left() + p[0] * fitted.width(),
-                            fitted.top() + p[1] * fitted.height(),
-                        )
-                    })
-                    .collect();
-                if points.len() == 1 {
-                    painter.circle_filled(points[0], width * 0.5, color);
-                } else if points.len() > 1 {
-                    painter.add(egui::Shape::line(
-                        points,
-                        egui::epaint::PathStroke::new(width, color),
-                    ));
-                }
+        // 画笔工具下画一圈光标，让手指知道笔有多大。
+        if editor.tool == Tool::Brush {
+            if let Some(pos) = response.hover_pos().filter(|p| fitted.contains(*p)) {
+                let radius = editor.brush_radius * fitted.width();
+                painter.circle_stroke(
+                    pos,
+                    radius,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 176, 64)),
+                );
             }
         }
 
         if commit {
-            dispatch.dispatch(Msg::CommitStroke);
+            dispatch.dispatch(Msg::CommitDraft);
         }
 
-        ui.add_space(6.0);
-        let can_undo = stroke_count > 0;
-        if button(ui, m, "撤销上一笔", ButtonKind::Text, can_undo) {
-            dispatch.dispatch(Msg::UndoStroke);
-        }
-        if button(ui, m, "清空蒙版", ButtonKind::Text, can_undo) {
-            dispatch.dispatch(Msg::ClearPaint);
-        }
         ui.label(
-            egui::RichText::new(format!("原图 {}×{}", preview.source[0], preview.source[1]))
-                .size(11.0)
-                .color(m.on_surface_variant),
+            egui::RichText::new(format!(
+                "{}×{} · 拖动画蒙版，双指捏合调{}",
+                frame.width,
+                frame.height,
+                if editor.tool == Tool::Brush {
+                    "笔刷大小"
+                } else {
+                    "羽化"
+                }
+            ))
+            .size(11.0)
+            .color(m.on_surface_variant),
         );
+        ui.add_space(8.0);
+
+        // ── 显示模式 + HDR 模拟 ─────────────────────────────────────
+        // 三个模式并排：必须给每个按钮定宽，否则第一个吃掉整行。
+        let modes = [Overlay::All, Overlay::Selected, Overlay::None];
+        let items: Vec<(String, ButtonKind, bool)> = modes
+            .iter()
+            .map(|mode| {
+                let kind = if editor.overlay == *mode {
+                    ButtonKind::Filled
+                } else {
+                    ButtonKind::Text
+                };
+                (mode.label().to_owned(), kind, true)
+            })
+            .collect();
+        if let Some(hit) = design::button_row(ui, m, &items) {
+            dispatch.dispatch(Msg::SetOverlay(modes[hit].index()));
+        }
+        ui.add_space(4.0);
+
+        let mut simulate = editor.simulate;
+        if switch(
+            ui,
+            m,
+            "simulate",
+            "HDR 预览",
+            Some("按当前蒙版和提亮参数模拟 HDR 观感"),
+            &mut simulate,
+        ) {
+            dispatch.dispatch(Msg::SetSimulate(simulate));
+        }
+        if editor.simulate {
+            let mut exposure = editor.exposure;
+            if slider(ui, m, "预览亮度", &mut exposure, 0.2..=4.0, 2, "×") {
+                dispatch.dispatch(Msg::SetExposure(exposure));
+            }
+        }
+    }
+
+    /// 蒙版列表 + 当前层的参数。
+    fn mask_card(&self, ui: &mut egui::Ui, m: &M3, dispatch: &Dispatcher<Msg>) {
+        let editor = self.editor.borrow();
+        section_title(ui, m, "蒙版图层", Some(&format!("{} 个", self.settings.masks.len())));
+
+        if self.settings.masks.is_empty() {
+            ui.label(
+                egui::RichText::new("选一个工具，在上面的预览图上拖一下就能建一个蒙版。")
+                    .size(12.0)
+                    .color(m.on_surface_variant),
+            );
+            return;
+        }
+
+        for (index, layer) in self.settings.masks.layers().iter().enumerate() {
+            let selected = index == self.layer_selected;
+            let row_bg = if selected {
+                mix(m.primary, m.surface, 0.22)
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 46.0),
+                egui::Sense::click(),
+            );
+            if row_bg != egui::Color32::TRANSPARENT {
+                ui.painter().rect_filled(rect, 12.0, row_bg);
+            } else if response.hovered() {
+                ui.painter().rect_filled(rect, 12.0, m.surface_variant);
+            }
+
+            // 启用开关
+            let switch_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 26.0, rect.center().y),
+                egui::vec2(40.0, 24.0),
+            );
+            let switch_response =
+                ui.interact(switch_rect, ui.id().with(("layer_on", index)), egui::Sense::click());
+            // 选中行是浅紫底：开启态改用深色轨道 + 浅色圆点，否则浅紫压浅紫看不出来。
+            let (track, thumb) = match (layer.enabled, selected) {
+                (true, false) => (m.primary, m.surface),
+                (true, true) => (m.on_primary, m.primary),
+                (false, true) => (m.on_primary.gamma_multiply(0.45), m.on_primary),
+                (false, false) => (m.outline_variant, m.surface),
+            };
+            ui.painter().rect_filled(switch_rect, 12.0, track);
+            let thumb_x = if layer.enabled {
+                switch_rect.right() - 12.0
+            } else {
+                switch_rect.left() + 12.0
+            };
+            ui.painter()
+                .circle_filled(egui::pos2(thumb_x, switch_rect.center().y), 9.0, thumb);
+            if switch_response.clicked() {
+                dispatch.dispatch(Msg::ToggleLayer(index));
+            }
+
+            // 选中行是浅紫底，文字必须换成 on_primary，否则浅底浅字看不清。
+            let (title_color, sub_color) = if selected {
+                (m.on_primary, m.on_primary.gamma_multiply(0.82))
+            } else {
+                (m.on_surface, m.on_surface_variant)
+            };
+            let name_x = rect.left() + 54.0;
+            ui.painter().text(
+                egui::pos2(name_x, rect.center().y - 8.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{} {}", combine_label(layer.combine), layer.name),
+                egui::FontId::proportional(13.5),
+                title_color,
+            );
+            ui.painter().text(
+                egui::pos2(name_x, rect.center().y + 10.0),
+                egui::Align2::LEFT_CENTER,
+                format!(
+                    "{} · {:.0}%{}",
+                    layer.shape.label(),
+                    layer.opacity * 100.0,
+                    if layer.follow_base { "" } else { " · 独立参数" }
+                ),
+                egui::FontId::proportional(11.0),
+                sub_color,
+            );
+
+            // 右侧：下移 + 删除
+            let close = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 20.0, rect.center().y),
+                egui::vec2(34.0, 34.0),
+            );
+            let close_response =
+                ui.interact(close, ui.id().with(("layer_del", index)), egui::Sense::click());
+            if close_response.hovered() {
+                ui.painter().circle_filled(close.center(), 15.0, m.surface_variant);
+            }
+            let painter = ui.painter();
+            let c = close.center();
+            let s = 6.0;
+            // 选中行是浅紫底，图标也要跟着变深，否则悬停圈和叉号都看不清。
+            let color = title_color;
+            painter.line_segment(
+                [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                egui::Stroke::new(1.8, color),
+            );
+            painter.line_segment(
+                [egui::pos2(c.x + s, c.y - s), egui::pos2(c.x - s, c.y + s)],
+                egui::Stroke::new(1.8, color),
+            );
+
+            // 蒙版的先后决定叠加顺序（后画的覆盖前面的），所以要能调。
+            let mut moved = false;
+            if index + 1 < self.settings.masks.len() {
+                let down = egui::Rect::from_center_size(
+                    egui::pos2(rect.right() - 56.0, rect.center().y),
+                    egui::vec2(30.0, 34.0),
+                );
+                let down_response =
+                    ui.interact(down, ui.id().with(("layer_down", index)), egui::Sense::click());
+                if down_response.hovered() {
+                    ui.painter().circle_filled(down.center(), 14.0, m.surface_variant);
+                }
+                let arrow = ui.painter();
+                let origin = down.center();
+                arrow.line_segment(
+                    [
+                        egui::pos2(origin.x, origin.y - 6.0),
+                        egui::pos2(origin.x, origin.y + 6.0),
+                    ],
+                    egui::Stroke::new(1.8, color),
+                );
+                arrow.line_segment(
+                    [
+                        egui::pos2(origin.x - 4.5, origin.y + 2.0),
+                        egui::pos2(origin.x, origin.y + 6.0),
+                    ],
+                    egui::Stroke::new(1.8, color),
+                );
+                arrow.line_segment(
+                    [
+                        egui::pos2(origin.x + 4.5, origin.y + 2.0),
+                        egui::pos2(origin.x, origin.y + 6.0),
+                    ],
+                    egui::Stroke::new(1.8, color),
+                );
+                moved = down_response.clicked();
+            }
+
+            if moved {
+                dispatch.dispatch(Msg::MoveLayer(index));
+            } else if close_response.clicked() {
+                dispatch.dispatch(Msg::RemoveLayer(index));
+            } else if response.double_clicked() {
+                dispatch.dispatch(Msg::BeginRename(index));
+            } else if response.clicked() {
+                dispatch.dispatch(Msg::SelectLayer(index));
+            }
+        }
+
+        // 改名输入框：`Msg` 要 `Copy`，所以文本草图放在编辑器里。
+        let renaming = self.editor.borrow().rename.clone();
+        if let Some((index, text)) = renaming {
+            let mut draft = text;
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut draft)
+                    .hint_text("蒙版名称")
+                    .desired_width(f32::INFINITY),
+            );
+            if let Some(slot) = self.editor.borrow_mut().rename.as_mut() {
+                slot.1 = draft;
+            }
+            if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                dispatch.dispatch(Msg::CommitRename);
+            }
+            ui.add_space(4.0);
+        }
+
+        ui.add_space(8.0);
+        let Some(layer) = self.settings.masks.layers().get(self.layer_selected).cloned() else {
+            return;
+        };
+
+        // ── 当前层参数 ──────────────────────────────────────────────
+        ui.label(
+            egui::RichText::new(format!("「{}」· {}", layer.name, layer.shape.label()))
+                .size(13.0)
+                .color(m.on_surface),
+        );
+        ui.add_space(6.0);
+
+        // 三种叠加方式并排：同样要定宽。
+        let combines = [
+            MaskCombine::Add,
+            MaskCombine::Subtract,
+            MaskCombine::Intersect,
+        ];
+        let items: Vec<(String, ButtonKind, bool)> = combines
+            .iter()
+            .map(|combine| {
+                let kind = if layer.combine == *combine {
+                    ButtonKind::Filled
+                } else {
+                    ButtonKind::Text
+                };
+                (combine_label(*combine).to_owned(), kind, true)
+            })
+            .collect();
+        if design::button_row(ui, m, &items).is_some() {
+            dispatch.dispatch(Msg::CycleCombine(self.layer_selected));
+        }
+
+        ui.add_space(4.0);
+        let mut invert = layer.invert;
+        if switch(ui, m, "invert", "反转", Some("把选中的区域换成它的补集"), &mut invert) {
+            dispatch.dispatch(Msg::ToggleInvert(self.layer_selected));
+        }
+
+        let mut opacity = layer.opacity * 100.0;
+        if slider(ui, m, "不透明度", &mut opacity, 0.0..=100.0, 0, "%") {
+            dispatch.dispatch(Msg::SetOpacity(self.layer_selected, (opacity / 100.0).clamp(0.0, 1.0)));
+        }
+
+        let mut feather = layer.shape.feather();
+        if slider(ui, m, "羽化", &mut feather, 0.0..=1.0, 2, "") {
+            dispatch.dispatch(Msg::SetFeather(self.layer_selected, feather));
+        }
+
+        let mut follow = layer.follow_base;
+        if switch(
+            ui,
+            m,
+            "follow",
+            "跟随全局提亮",
+            Some("关闭后这个蒙版用自己的上限与起点"),
+            &mut follow,
+        ) {
+            dispatch.dispatch(Msg::ToggleFollowBase(self.layer_selected));
+        }
+
+        if layer.follow_base {
+            ui.label(
+                egui::RichText::new(format!(
+                    "起点 {:.2} · 上限 {:.2}×（与全局相同）",
+                    layer.knee, layer.max_boost
+                ))
+                .size(11.5)
+                .color(m.on_surface_variant),
+            );
+        } else {
+            let mut boost = layer.max_boost;
+            if slider(ui, m, "提亮上限", &mut boost, 1.0..=8.0, 2, "×") {
+                dispatch.dispatch(Msg::SetLayerBoost(self.layer_selected, boost));
+            }
+            let mut knee = layer.knee;
+            if slider(ui, m, "提亮起点", &mut knee, 0.0..=0.95, 2, "") {
+                dispatch.dispatch(Msg::SetLayerKnee(self.layer_selected, knee));
+            }
+        }
+
+        // ── 形状专属 ────────────────────────────────────────────────
+        ui.add_space(6.0);
+        match &layer.shape {
+            MaskShape::Linear { .. } | MaskShape::Radial { .. } => {
+                ui.label(
+                    egui::RichText::new("在预览图上再拖一次可以重新摆放，双指捏合调羽化。")
+                        .size(11.5)
+                        .color(m.on_surface_variant),
+                );
+            }
+            MaskShape::Luminance {
+                min,
+                max,
+                softness,
+            } => {
+                let (mut low, mut high, mut soft) = (*min, *max, *softness);
+                let mut changed = false;
+                changed |= slider(ui, m, "亮度下限", &mut low, 0.0..=1.0, 2, "");
+                changed |= slider(ui, m, "亮度上限", &mut high, 0.0..=1.0, 2, "");
+                changed |= slider(ui, m, "过渡", &mut soft, 0.0..=1.0, 2, "");
+                if changed {
+                    dispatch.dispatch(Msg::SetLuma(self.layer_selected, low, high, soft));
+                }
+            }
+            MaskShape::Color {
+                hue,
+                hue_tolerance,
+                saturation_min,
+                softness,
+            } => {
+                let (mut h, mut tol, mut sat, mut soft) =
+                    (*hue, *hue_tolerance, *saturation_min, *softness);
+                let mut changed = false;
+                changed |= slider(ui, m, "色相", &mut h, 0.0..=1.0, 2, "");
+                changed |= slider(ui, m, "容差", &mut tol, 0.005..=0.5, 3, "");
+                changed |= slider(ui, m, "最低饱和", &mut sat, 0.0..=0.95, 2, "");
+                changed |= slider(ui, m, "过渡", &mut soft, 0.0..=1.0, 2, "");
+                if changed {
+                    dispatch.dispatch(Msg::SetHue(self.layer_selected, h, tol, sat, soft));
+                }
+
+                // 色相条：让人看出当前选的是哪一段颜色。
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+                let steps = 48;
+                for step in 0..steps {
+                    let t = step as f32 / steps as f32;
+                    let (r, g, b) = mask_ui::hue_rgb(t);
+                    let x0 = rect.left() + rect.width() * step as f32 / steps as f32;
+                    let x1 = rect.left() + rect.width() * (step + 1) as f32 / steps as f32;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+                        0.0,
+                        egui::Color32::from_rgb(r, g, b),
+                    );
+                }
+                let marker_x = rect.left() + rect.width() * *hue;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(marker_x, rect.top() - 2.0),
+                        egui::pos2(marker_x, rect.bottom() + 2.0),
+                    ],
+                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                );
+            }
+            MaskShape::Brush(mask) => {
+                ui.label(
+                    egui::RichText::new(format!("{} 笔", mask.strokes.len()))
+                        .size(11.5)
+                        .color(m.on_surface_variant),
+                );
+                let mut radius = editor.brush_radius;
+                if slider(ui, m, "笔刷大小", &mut radius, 0.005..=0.5, 3, "") {
+                    dispatch.dispatch(Msg::SetBrushRadius(radius));
+                }
+                let mut hardness = editor.brush_hardness;
+                if slider(ui, m, "硬度", &mut hardness, 0.0..=1.0, 2, "") {
+                    dispatch.dispatch(Msg::SetBrushHardness(hardness));
+                }
+                let mut flow = editor.brush_flow;
+                if slider(ui, m, "不透明度", &mut flow, 0.05..=1.0, 2, "") {
+                    dispatch.dispatch(Msg::SetBrushFlow(flow));
+                }
+                let mut erase = editor.brush_erase;
+                if switch(ui, m, "erase", "橡皮擦", Some("擦掉已经画上的部分"), &mut erase) {
+                    dispatch.dispatch(Msg::SetBrushErase(erase));
+                }
+                let has_strokes = !mask.is_empty();
+                let items: Vec<(String, ButtonKind, bool)> = vec![
+                    ("撤销一笔".to_owned(), ButtonKind::Text, has_strokes),
+                    ("清空".to_owned(), ButtonKind::Text, has_strokes),
+                ];
+                match design::button_row(ui, m, &items) {
+                    Some(0) => dispatch.dispatch(Msg::UndoStroke),
+                    Some(_) => dispatch.dispatch(Msg::ClearBrush),
+                    None => {}
+                }
+            }
+        }
     }
 }
 
@@ -769,63 +1219,61 @@ impl Component for Root {
             });
 
         // ── 主体 ────────────────────────────────────────────────────
-        egui::CentralPanel::no_frame().show(ui, |ui| {
-            // 画笔开启时关掉「拖动页面」手势，否则手指在预览图上滑动会
-            // 同时被 ScrollArea 拿走，笔画和滚动互相抢。
-            let scroll_source = if self.painting {
-                egui::containers::scroll_area::ScrollSource {
-                    drag: egui::containers::scroll_area::DragScroll::Never,
-                    ..Default::default()
-                }
-            } else {
-                egui::containers::scroll_area::ScrollSource::default()
-            };
+        // 右边留 10 px：滚动条浮在内容之上，不留白会把右对齐的数值裁掉。
+        egui::CentralPanel::no_frame()
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 0,
+                right: 10,
+                top: 0,
+                bottom: 0,
+            }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(14.0);
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .scroll_source(scroll_source)
-                .show(ui, |ui| {
-                    ui.add_space(14.0);
+                        if self.items.is_empty() {
+                            card(ui, &m, false, |ui| empty_state(ui, &m));
+                        } else {
+                            card(ui, &m, false, |ui| {
+                                section_title(
+                                    ui,
+                                    &m,
+                                    "待转换图片",
+                                    Some(&format!("{} 张", self.items.len())),
+                                );
+                                for (index, item) in self.items.iter().enumerate() {
+                                    file_row(ui, &m, index, item, index == self.selected, dispatch);
+                                }
+                            });
 
-                    if self.items.is_empty() {
-                        card(ui, &m, false, |ui| empty_state(ui, &m));
-                    } else {
+                            ui.add_space(12.0);
+                            self.ensure_frame();
+                            card(ui, &m, false, |ui| self.preview_card(ui, &m, dispatch));
+                            ui.add_space(12.0);
+                            card(ui, &m, false, |ui| self.mask_card(ui, &m, dispatch));
+                        }
+
+                        ui.add_space(12.0);
                         card(ui, &m, false, |ui| {
-                            section_title(
-                                ui,
-                                &m,
-                                "待转换图片",
-                                Some(&format!("{} 张", self.items.len())),
-                            );
-                            for (index, item) in self.items.iter().enumerate() {
-                                file_row(ui, &m, index, item, index == self.selected, dispatch);
-                            }
+                            settings_card(ui, &m, &self.settings, dispatch);
                         });
 
-                        ui.add_space(12.0);
-                        self.ensure_preview(ui.ctx());
-                        card(ui, &m, false, |ui| self.preview_card(ui, &m, dispatch));
-                    }
+                        if !self.notice.is_empty() {
+                            ui.add_space(12.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&self.notice)
+                                        .size(12.5)
+                                        .color(m.on_surface_variant),
+                                );
+                            });
+                        }
 
-                    ui.add_space(12.0);
-                    card(ui, &m, false, |ui| {
-                        settings_card(ui, &m, &self.settings, dispatch);
+                        ui.add_space(20.0);
                     });
-
-                    if !self.notice.is_empty() {
-                        ui.add_space(12.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(&self.notice)
-                                    .size(12.5)
-                                    .color(m.on_surface_variant),
-                            );
-                        });
-                    }
-
-                    ui.add_space(20.0);
-                });
-        });
+            });
     }
 
 
@@ -868,37 +1316,154 @@ impl Component for Root {
                     self.notice = format!("正在编辑第 {} 张的蒙版", index + 1);
                 }
             }
-            Msg::SetPainting(v) => {
-                self.painting = v;
-                if !v {
-                    self.paint_ui.borrow_mut().active = None;
+            Msg::SetTool(value) => {
+                self.editor.borrow_mut().cancel_drag();
+                self.editor.borrow_mut().tool = Tool::from_index(value);
+            }
+            Msg::SetOverlay(value) => self.editor.borrow_mut().overlay = Overlay::from_index(value),
+            Msg::SetSimulate(value) => self.editor.borrow_mut().simulate = value,
+            Msg::SetExposure(value) => self.editor.borrow_mut().exposure = value.clamp(0.2, 4.0),
+            Msg::CommitDraft => {
+                let pending = self.editor.borrow_mut().take_pending();
+                if let Some(layer) = pending {
+                    self.masks_mut().push(layer);
+                    let count = self.settings.masks.len();
+                    self.layer_selected = count.saturating_sub(1);
+                    self.notice = format!("已建第 {count} 个蒙版");
                 }
             }
-            Msg::SetErasing(v) => self.erasing = v,
-            Msg::SetShowMask(v) => self.show_mask = v,
-            Msg::SetBrushGain(v) => self.brush_gain = v.clamp(0.05, 1.0),
-            Msg::SetBrushRadius(v) => self.brush_radius = v.clamp(0.002, 0.5),
-            Msg::CommitStroke => {
-                if let Some(stroke) = self.paint_ui.borrow_mut().pending.take() {
-                    let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
-                    layer.push(stroke);
-                    let count = self.settings.paint.len();
-                    self.notice = format!("已画 {count} 笔");
+            Msg::CancelDraft => self.editor.borrow_mut().cancel_drag(),
+            Msg::SelectLayer(index) => {
+                if index < self.settings.masks.len() {
+                    self.layer_selected = index;
                 }
             }
+            Msg::RemoveLayer(index) => {
+                let removed = self.masks_mut().remove(index);
+                if removed {
+                    let left = self.settings.masks.len();
+                    self.layer_selected = self.layer_selected.min(left.saturating_sub(1));
+                    self.notice = format!("还剩 {left} 个蒙版");
+                }
+            }
+            Msg::MoveLayer(index) => {
+                let layers = self.masks_mut().layers_mut();
+                if index + 1 < layers.len() {
+                    layers.swap(index, index + 1);
+                    self.layer_selected = index + 1;
+                }
+            }
+            Msg::ToggleLayer(index) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.enabled = !layer.enabled;
+                }
+            }
+            Msg::CycleCombine(index) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.combine = match layer.combine {
+                        MaskCombine::Add => MaskCombine::Subtract,
+                        MaskCombine::Subtract => MaskCombine::Intersect,
+                        MaskCombine::Intersect => MaskCombine::Add,
+                    };
+                }
+            }
+            Msg::ToggleInvert(index) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.invert = !layer.invert;
+                }
+            }
+            Msg::ToggleFollowBase(index) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.follow_base = !layer.follow_base;
+                }
+            }
+            Msg::SetOpacity(index, value) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.opacity = value.clamp(0.0, 1.0);
+                }
+            }
+            Msg::SetLayerBoost(index, value) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.max_boost = value.clamp(1.0, 16.0);
+                }
+            }
+            Msg::SetLayerKnee(index, value) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.knee = value.clamp(0.0, 0.99);
+                }
+            }
+            Msg::SetFeather(index, value) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    layer.shape.set_feather(value);
+                }
+            }
+            Msg::SetBrushRadius(v) => self.editor.borrow_mut().brush_radius = v.clamp(0.005, 0.5),
+            Msg::SetBrushHardness(v) => {
+                self.editor.borrow_mut().brush_hardness = v.clamp(0.0, 1.0)
+            }
+            Msg::SetBrushFlow(v) => self.editor.borrow_mut().brush_flow = v.clamp(0.05, 1.0),
+            Msg::SetBrushErase(v) => self.editor.borrow_mut().brush_erase = v,
             Msg::UndoStroke => {
-                let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
-                if layer.undo() {
-                    let count = self.settings.paint.len();
-                    self.notice = format!("已画 {count} 笔");
+                let selected = self.layer_selected;
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(selected) {
+                    if let MaskShape::Brush(mask) = &mut layer.shape {
+                        mask.undo();
+                    }
                 }
             }
-            Msg::ClearPaint => {
-                let layer = std::sync::Arc::make_mut(&mut self.settings.paint);
-                layer.clear();
-                self.paint_ui.borrow_mut().active = None;
-                self.paint_ui.borrow_mut().pending = None;
-                self.notice = "蒙版已清空".to_owned();
+            Msg::ClearBrush => {
+                let selected = self.layer_selected;
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(selected) {
+                    if let MaskShape::Brush(mask) = &mut layer.shape {
+                        mask.clear();
+                    }
+                }
+            }
+            Msg::SetLuma(index, low, high, soft) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    if let MaskShape::Luminance { min, max, softness } = &mut layer.shape {
+                        *min = low.clamp(0.0, 1.0);
+                        *max = high.clamp(*min, 1.0);
+                        *softness = soft.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            Msg::SetHue(index, hue, tolerance, saturation, soft) => {
+                if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                    if let MaskShape::Color {
+                        hue: h,
+                        hue_tolerance,
+                        saturation_min,
+                        softness,
+                    } = &mut layer.shape
+                    {
+                        *h = hue.rem_euclid(1.0);
+                        *hue_tolerance = tolerance.clamp(0.001, 0.5);
+                        *saturation_min = saturation.clamp(0.0, 0.95);
+                        *softness = soft.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            Msg::BeginRename(index) => {
+                let name = self
+                    .settings
+                    .masks
+                    .layers()
+                    .get(index)
+                    .map(|layer| layer.name.clone())
+                    .unwrap_or_default();
+                self.editor.borrow_mut().rename = Some((index, name));
+            }
+            Msg::CommitRename => {
+                let draft = self.editor.borrow_mut().rename.take();
+                if let Some((index, name)) = draft {
+                    let trimmed = name.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        if let Some(layer) = self.masks_mut().layers_mut().get_mut(index) {
+                            layer.name = trimmed;
+                        }
+                    }
+                }
             }
         }
     }

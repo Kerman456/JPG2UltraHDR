@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "jpg2ultrahdr"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "jpg2ultrahdr-android"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "android-activity",
  "android_logger",

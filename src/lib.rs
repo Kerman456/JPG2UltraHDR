@@ -9,11 +9,14 @@
 //! The primary is re-encoded (ultrajpeg always re-encodes from pixels), so the
 //! gain map is computed against exactly the pixels that end up in the file.
 
+pub mod mask;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+pub use mask::{BrushMask, BrushStroke, MaskCombine, MaskLayer, MaskShape, MaskStack, rgb_to_hsl};
 use rayon::prelude::*;
 use ultrahdr_core::color::{gamut_conversion_matrix, luma_coefficients, srgb_eotf, srgb_oetf};
 use ultrahdr_core::{ColorGamut, ColorTransfer, GainMapMetadata, PixelFormat, RawImage};
@@ -73,296 +76,6 @@ const ULTRA_HDR_MARKERS: [&[u8]; 2] = [
     b"urn:iso:std:iso:ts:21496:-1",
 ];
 
-// ---- hand-painted gain overlay -------------------------------------------
-//
-// The curve above is global: it decides one knee for the whole picture. Real
-// scenes are not uniform — a window in an otherwise dim room, a lamp, a patch
-// of sky — so the user needs to point at *where* the extra brightness goes.
-//
-// Strokes are stored in normalized coordinates (0..1 across width and height)
-// rather than in pixels, so one painting session applies to every picture in
-// the batch and survives a change of output scale. The brush radius is also
-// normalized, but against the image *width*: that keeps the brush round on
-// screen whatever the aspect ratio.
-//
-// Coverage composes as an ordinary "over" operation, which makes the result
-// independent of how many times a pixel is touched:
-//
-//     value += a * (target - value)     // a = stroke coverage, target = 0..1
-//     coverage += a * (1 - coverage)
-//
-// The eraser only shrinks coverage. Where coverage is 0 the automatic curve is
-// left exactly as it was, so painting is additive: it takes over only where
-// the user actually drew.
-
-/// Hard caps so a runaway session cannot make the config file unbounded.
-const MAX_STROKES: usize = 400;
-const MAX_POINTS_PER_STROKE: usize = 4000;
-
-/// When the user has painted, the boost ceiling never drops below this, so a
-/// deliberate stroke is not squeezed by a conservative automatic curve.
-const PAINT_MIN_BOOST: f32 = 2.5;
-
-/// One painted (or erased) polyline.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Stroke {
-    /// `true` = eraser: removes coverage instead of adding it.
-    pub erase: bool,
-    /// Target gain as a fraction of `max_boost` (0 = untouched, 1 = full).
-    /// Ignored when [`Self::erase`] is set.
-    pub gain: f32,
-    /// Brush radius in units of the image width.
-    pub radius: f32,
-    /// Polyline in normalized coordinates.
-    pub points: Vec<[f32; 2]>,
-}
-
-impl Stroke {
-    pub fn new(gain: f32, radius: f32, erase: bool, start: [f32; 2]) -> Self {
-        Self {
-            erase,
-            gain: gain.clamp(0.0, 1.0),
-            radius: radius.clamp(0.0005, 0.5),
-            points: vec![start],
-        }
-    }
-
-    /// Append a sample, dropping samples that are closer than the brush itself:
-    /// denser points add nothing and would bloat the config file.
-    pub fn push(&mut self, point: [f32; 2]) {
-        let last = self.points.last().copied().unwrap_or(point);
-        let dx = point[0] - last[0];
-        let dy = point[1] - last[1];
-        if (dx * dx + dy * dy).sqrt() < (self.radius * 0.35).max(0.002) {
-            return;
-        }
-        if self.points.len() < MAX_POINTS_PER_STROKE {
-            self.points.push(point);
-        }
-    }
-}
-
-/// A stack of strokes, applied in order.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PaintLayer {
-    strokes: Vec<Stroke>,
-}
-
-impl PaintLayer {
-    pub fn is_empty(&self) -> bool {
-        self.strokes.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.strokes.len()
-    }
-
-    pub fn strokes(&self) -> &[Stroke] {
-        &self.strokes
-    }
-
-    pub fn push(&mut self, stroke: Stroke) {
-        if stroke.points.is_empty() || self.strokes.len() >= MAX_STROKES {
-            return;
-        }
-        self.strokes.push(stroke);
-    }
-
-    /// Remove the most recent stroke; returns whether anything was removed.
-    pub fn undo(&mut self) -> bool {
-        self.strokes.pop().is_some()
-    }
-
-    pub fn clear(&mut self) {
-        self.strokes.clear();
-    }
-
-    /// One-line encoding for the config file.
-    ///
-    /// Format: strokes separated by `~`, each `E|gain,radius,u:v,u:v,...` where
-    /// `E` is `1` for an eraser. Numbers use a fixed number of decimals so the
-    /// text is stable across runs (the config writer compares strings).
-    pub fn encode(&self) -> String {
-        let mut out = String::new();
-        for (index, stroke) in self.strokes.iter().enumerate() {
-            if index > 0 {
-                out.push('~');
-            }
-            out.push(if stroke.erase { '1' } else { '0' });
-            out.push('|');
-            out.push_str(&format!("{:.3},{:.4}", stroke.gain, stroke.radius));
-            for point in &stroke.points {
-                out.push_str(&format!(",{:.5}:{:.5}", point[0], point[1]));
-            }
-        }
-        out
-    }
-
-    /// Inverse of [`Self::encode`]. Malformed input is skipped stroke by stroke
-    /// rather than failing the whole config.
-    pub fn decode(text: &str) -> Self {
-        let mut layer = PaintLayer::default();
-        for chunk in text.split('~') {
-            let Some((flag, rest)) = chunk.split_once('|') else {
-                continue;
-            };
-            let mut parts = rest.split(',');
-            let (Some(gain), Some(radius)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            let (Ok(gain), Ok(radius)) = (gain.parse::<f32>(), radius.parse::<f32>()) else {
-                continue;
-            };
-            let mut stroke = Stroke {
-                erase: flag.trim() == "1",
-                gain: gain.clamp(0.0, 1.0),
-                radius: radius.clamp(0.0005, 0.5),
-                points: Vec::new(),
-            };
-            for pair in parts {
-                let Some((u, v)) = pair.split_once(':') else {
-                    continue;
-                };
-                let (Ok(u), Ok(v)) = (u.parse::<f32>(), v.parse::<f32>()) else {
-                    continue;
-                };
-                if stroke.points.len() < MAX_POINTS_PER_STROKE {
-                    stroke.points.push([u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)]);
-                }
-            }
-            if !stroke.points.is_empty() {
-                layer.push(stroke);
-            }
-        }
-        layer
-    }
-
-    /// Rasterize coverage (`0..1`) and the effective target gain (`0..1`) at
-    /// gain-map resolution. Both buffers are `width * height` long.
-    fn rasterize(&self, width: u32, height: u32) -> (Vec<f32>, Vec<f32>) {
-        let count = (width as usize) * (height as usize);
-        let mut coverage = vec![0.0f32; count];
-        let mut target = vec![0.0f32; count];
-
-        if self.strokes.is_empty() || width == 0 || height == 0 {
-            return (coverage, target);
-        }
-
-        let w = width as f32;
-        let h = height as f32;
-
-        for stroke in &self.strokes {
-            if stroke.points.is_empty() {
-                continue;
-            }
-            // Brush geometry in mask pixels. `radius` is in width units, so it
-            // is the same in x and y — a round brush.
-            let radius = (stroke.radius * w).max(0.75);
-            let feather = radius.min(2.0).max(0.75);
-
-            // Bounding box of the whole polyline, so a small stroke does not
-            // scan the entire mask.
-            let (mut min_u, mut min_v) = (f32::MAX, f32::MAX);
-            let (mut max_u, mut max_v) = (f32::MIN, f32::MIN);
-            for point in &stroke.points {
-                min_u = min_u.min(point[0]);
-                min_v = min_v.min(point[1]);
-                max_u = max_u.max(point[0]);
-                max_v = max_v.max(point[1]);
-            }
-            let margin = radius + feather;
-            let x0 = ((min_u * w) - margin).floor().max(0.0) as u32;
-            let y0 = ((min_v * h) - margin).floor().max(0.0) as u32;
-            let x1 = (((max_u * w) + margin).ceil() as u32).min(width.saturating_sub(1));
-            let y1 = (((max_v * h) + margin).ceil() as u32).min(height.saturating_sub(1));
-            if x1 < x0 || y1 < y0 {
-                continue;
-            }
-
-            // Local polyline in mask pixel space.
-            let points: Vec<(f32, f32)> = stroke
-                .points
-                .iter()
-                .map(|p| (p[0] * w, p[1] * h))
-                .collect();
-
-            let rows = (y1 - y0 + 1) as usize;
-            let stride = width as usize;
-            // Skip to the first row inside the bounding box, otherwise the
-            // stroke would land near the top of the mask instead of where it
-            // was drawn.
-            let skip = (y0 as usize) * stride;
-            let cover = &mut coverage[skip..];
-            let target = &mut target[skip..];
-            let gain = stroke.gain;
-            let erase = stroke.erase;
-
-            let mut slots: Vec<(&mut [f32], &mut [f32])> = Vec::with_capacity(rows);
-            {
-                let mut rest_c: &mut [f32] = cover;
-                let mut rest_t: &mut [f32] = target;
-                for _ in 0..rows {
-                    let (head_c, tail_c) = rest_c.split_at_mut(stride);
-                    let (head_t, tail_t) = rest_t.split_at_mut(stride);
-                    slots.push((head_c, head_t));
-                    rest_c = tail_c;
-                    rest_t = tail_t;
-                }
-            }
-
-            slots
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(row, (cover_row, target_row))| {
-                    let y = (y0 + row as u32) as f32 + 0.5;
-                    for x in x0..=x1 {
-                        let px = x as f32 + 0.5;
-                        let distance = distance_to_polyline(&points, px, y);
-                        if distance >= radius {
-                            continue;
-                        }
-                        let a = ((radius - distance) / feather).clamp(0.0, 1.0);
-                        if a <= 0.0 {
-                            continue;
-                        }
-                        let index = x as usize;
-                        if erase {
-                            cover_row[index] *= 1.0 - a;
-                        } else {
-                            target_row[index] += a * (gain - target_row[index]);
-                            cover_row[index] += a * (1.0 - cover_row[index]);
-                        }
-                    }
-                });
-        }
-
-        (coverage, target)
-    }
-}
-
-/// Shortest distance from `(px, py)` to the polyline, in pixels.
-fn distance_to_polyline(points: &[(f32, f32)], px: f32, py: f32) -> f32 {
-    if points.len() == 1 {
-        let (x, y) = points[0];
-        return ((px - x).powi(2) + (py - y).powi(2)).sqrt();
-    }
-    let mut best = f32::MAX;
-    for pair in points.windows(2) {
-        let (ax, ay) = pair[0];
-        let (bx, by) = pair[1];
-        let (dx, dy) = (bx - ax, by - ay);
-        let length_squared = dx * dx + dy * dy;
-        let t = if length_squared > 1e-9 {
-            (((px - ax) * dx + (py - ay) * dy) / length_squared).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (cx, cy) = (ax + dx * t, ay + dy * t);
-        best = best.min(((px - cx).powi(2) + (py - cy).powi(2)).sqrt());
-    }
-    best
-}
-
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// Quality of the SDR primary JPEG (1..=100).
@@ -385,11 +98,11 @@ pub struct Settings {
     pub to_display_p3: bool,
     /// Copy the source EXIF (orientation, capture time, camera) into the output.
     pub keep_exif: bool,
-    /// Hand-painted overlay applied on top of the curve. Empty = off.
+    /// Local adjustment layers applied on top of the global curve. Empty = off.
     ///
     /// `Arc` because every batch worker clones the whole [`Settings`], and a
-    /// long painting session would otherwise be copied per file.
-    pub paint: Arc<PaintLayer>,
+    /// long editing session would otherwise be copied per file.
+    pub masks: Arc<MaskStack>,
 }
 
 impl Default for Settings {
@@ -404,7 +117,7 @@ impl Default for Settings {
             progressive: true,
             to_display_p3: false,
             keep_exif: true,
-            paint: Arc::new(PaintLayer::default()),
+            masks: Arc::new(MaskStack::default()),
         }
     }
 }
@@ -458,7 +171,15 @@ pub struct ToneParams {
 /// the same gain map.
 pub fn auto_tone(primary: &RawImage) -> ToneParams {
     let (p95, p999) = top_percentiles(primary);
+    tone_from_percentiles(p95, p999)
+}
 
+/// The part of [`auto_tone`] that only needs the two percentiles.
+///
+/// Split out so the editor can run the same rule on its low-resolution copy:
+/// a 1000-pixel-wide thumbnail and the full frame agree on where the shoulder
+/// belongs to within the resolution of the slider.
+pub fn tone_from_percentiles(p95: f32, p999: f32) -> ToneParams {
     // P95 first: starting the shoulder above 95% of the picture keeps the
     // expansion confined to the top of the range.
     let reach = smoothstep_inv(need_t());
@@ -565,7 +286,7 @@ fn percentile(histogram: &[u32; 256], total: u64, fraction: f64) -> f32 {
 }
 
 /// Pick the curve to encode: the user's numbers, or ones derived per picture.
-fn resolve_tone(primary: &RawImage, settings: &Settings) -> ToneParams {
+pub fn resolve_tone(primary: &RawImage, settings: &Settings) -> ToneParams {
     let mut tone = if settings.auto_tone {
         auto_tone(primary)
     } else {
@@ -579,13 +300,14 @@ fn resolve_tone(primary: &RawImage, settings: &Settings) -> ToneParams {
         }
     };
 
-    // Painted areas can only reach `max_boost`. A flat, dim picture makes the
-    // automatic pass hand back an almost empty curve (see the early return in
-    // `auto_tone`), which would cap a deliberate brush stroke at 1.5x. Raise the
-    // ceiling when the user actually painted something; pixels outside the
-    // strokes keep their own value, so this does not lift the rest of the frame.
-    if !settings.paint.is_empty() && tone.max_boost < PAINT_MIN_BOOST {
-        tone.max_boost = PAINT_MIN_BOOST;
+    // Local layers can only reach the ceiling the metadata advertises. A flat,
+    // dim picture makes the automatic pass hand back an almost empty curve (see
+    // the early return in `auto_tone`), which would cap a deliberate mask at
+    // 1.5x. Raise the ceiling when a mask actually asks for more; pixels outside
+    // the masks keep their own gain, so this does not lift the rest of the frame.
+    let wanted = settings.masks.capacity(tone);
+    if wanted > tone.max_boost {
+        tone.max_boost = wanted;
         tone.top_stops = tone.max_boost.log2();
     }
 
@@ -699,6 +421,236 @@ pub fn thumbnail_rgba(path: &Path, max_edge: u32) -> Result<(u32, u32, Vec<u8>)>
     Ok((out_w, out_h, rgba))
 }
 
+/// A small copy of the picture the editor can evaluate masks against.
+///
+/// Masks are stored in normalized coordinates, so the same weights that decide
+/// the real gain map can be computed on a 1000-pixel-wide copy and drawn
+/// instantly. That is what keeps dragging a gradient cheap: only this buffer is
+/// touched until the user lets go and the full-resolution conversion runs.
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    /// RGB8, `width * height * 3` bytes.
+    pub rgb: Arc<Vec<u8>>,
+    /// Perceptual luminance per pixel, precomputed once.
+    level: Vec<f32>,
+}
+
+impl PreviewFrame {
+    pub fn load(path: &Path, max_edge: u32) -> Result<Self> {
+        let (width, height, rgba) = thumbnail_rgba(path, max_edge)?;
+        let mut rgb = Vec::with_capacity((width as usize) * (height as usize) * 3);
+        let mut level = Vec::with_capacity((width as usize) * (height as usize));
+        let luma = luma_coefficients(ColorGamut::Bt709);
+        for pixel in rgba.chunks_exact(4) {
+            let (r, g, b) = (pixel[0], pixel[1], pixel[2]);
+            rgb.extend_from_slice(&[r, g, b]);
+            let luminance = luma[0] * srgb_eotf(r as f32 / 255.0)
+                + luma[1] * srgb_eotf(g as f32 / 255.0)
+                + luma[2] * srgb_eotf(b as f32 / 255.0);
+            level.push(srgb_oetf(luminance.clamp(0.0, 1.0)));
+        }
+        Ok(Self {
+            width,
+            height,
+            rgb: Arc::new(rgb),
+            level,
+        })
+    }
+
+    /// Perceptual luminance at one pixel, `0..1`.
+    ///
+    /// The editor uses this to seed the luminance tool from whatever the pointer
+    /// is over, and to evaluate a mask while a drag is still in progress.
+    pub fn level_at(&self, x: usize, y: usize) -> f32 {
+        let x = x.min(self.width.saturating_sub(1) as usize);
+        let y = y.min(self.height.saturating_sub(1) as usize);
+        self.level[y * self.width as usize + x]
+    }
+
+    /// The same two percentiles [`auto_tone`] uses, measured on this copy.
+    ///
+    /// The editor must show the curve the export will use, but it has no
+    /// full-resolution pixels, so it runs the rule on its own histogram. A 1000
+    /// px copy agrees with the original to within a slider step.
+    pub fn tone(&self) -> ToneParams {
+        let mut histogram = [0u32; 256];
+        for &level in &self.level {
+            let bin = (level * 255.0).round().clamp(0.0, 255.0) as usize;
+            histogram[bin] += 1;
+        }
+        let count: u64 = histogram.iter().map(|&c| u64::from(c)).sum();
+        if count == 0 {
+            return tone_from_percentiles(1.0, 1.0);
+        }
+        tone_from_percentiles(
+            percentile(&histogram, count, 0.95),
+            percentile(&histogram, count, 0.999),
+        )
+    }
+
+    /// Combined mask weight per pixel, `0..1`.
+    pub fn coverage(&self, masks: &MaskStack) -> Vec<f32> {
+        let count = (self.width as usize) * (self.height as usize);
+        let mut out = vec![0.0f32; count];
+        // `has_weight`, not `has_effect`: a new mask follows the base curve and
+        // changes no gain, but the overlay still has to show where it is.
+        if !masks.has_weight() {
+            return out;
+        }
+        let prepared = masks.prepare(self.width, self.height);
+        let (fw, fh) = (self.width as f32, self.height as f32);
+        out.par_chunks_mut(self.width as usize)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, slot) in row.iter_mut().enumerate() {
+                    let index = y * self.width as usize + x;
+                    let rgb = [
+                        self.rgb[index * 3],
+                        self.rgb[index * 3 + 1],
+                        self.rgb[index * 3 + 2],
+                    ];
+                    *slot = masks.weight_at(
+                        &prepared,
+                        index,
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        fw,
+                        fh,
+                        self.level[index],
+                        rgb,
+                    );
+                }
+            });
+        out
+    }
+
+    /// Paint one layer's weight on top of the picture, for the list's
+    /// "show only this mask" toggle.
+    pub fn overlay_one_rgba(&self, masks: &MaskStack, layer: usize) -> Vec<u8> {
+        let count = (self.width as usize) * (self.height as usize);
+        let buffer = masks.prepare_one(layer, self.width, self.height);
+        let (fw, fh) = (self.width as f32, self.height as f32);
+        let mut coverage = vec![0.0f32; count];
+        coverage
+            .par_chunks_mut(self.width as usize)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, slot) in row.iter_mut().enumerate() {
+                    let index = y * self.width as usize + x;
+                    let rgb = [
+                        self.rgb[index * 3],
+                        self.rgb[index * 3 + 1],
+                        self.rgb[index * 3 + 2],
+                    ];
+                    *slot = masks.weight_of_layer(
+                        layer,
+                        buffer.as_deref(),
+                        index,
+                        x as f32 + 0.5,
+                        y as f32 + 0.5,
+                        fw,
+                        fh,
+                        self.level[index],
+                        rgb,
+                    );
+                }
+            });
+        self.tint(&coverage)
+    }
+
+    /// Paint the mask weights on top of the picture: amber where a layer adds
+    /// brightness, red where it subtracts.
+    pub fn overlay_rgba(&self, masks: &MaskStack) -> Vec<u8> {
+        self.tint(&self.coverage(masks))
+    }
+
+    fn tint(&self, coverage: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(coverage.len() * 4);
+        for (index, weight) in coverage.iter().enumerate() {
+            let (r, g, b) = (
+                self.rgb[index * 3],
+                self.rgb[index * 3 + 1],
+                self.rgb[index * 3 + 2],
+            );
+            let mix = (weight.clamp(0.0, 1.0) * 0.65).min(1.0);
+            let tint = [255.0f32, 150.0, 40.0];
+            out.extend_from_slice(&[
+                (r as f32 * (1.0 - mix) + tint[0] * mix) as u8,
+                (g as f32 * (1.0 - mix) + tint[1] * mix) as u8,
+                (b as f32 * (1.0 - mix) + tint[2] * mix) as u8,
+                255,
+            ]);
+        }
+        out
+    }
+
+    /// Simulate what an HDR viewer would show, so the mask's effect on the
+    /// picture is visible before exporting anything.
+    ///
+    /// The gain map is encoded in log space; this decodes the same value and
+    /// applies it to the SDR pixels, then tone-maps back into `0..255` the way a
+    /// display would.
+    pub fn simulated_rgba(&self, masks: &MaskStack, tone: ToneParams, exposure: f32) -> Vec<u8> {
+        let count = (self.width as usize) * (self.height as usize);
+        let prepared = if masks.has_effect() {
+            masks.prepare(self.width, self.height)
+        } else {
+            Vec::new()
+        };
+        let active = masks.has_effect();
+        let (fw, fh) = (self.width as f32, self.height as f32);
+        let knee = tone.knee.clamp(0.0, 0.999);
+        let span = (1.0 - knee).max(1e-6);
+        let max_boost = tone.max_boost.clamp(1.0, 16.0);
+        let mut out = vec![0u8; count * 4];
+        let exposure = exposure.clamp(0.05, 8.0);
+
+        out.par_chunks_mut(self.width as usize * 4)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+                    let index = y * self.width as usize + x;
+                    let rgb = [
+                        self.rgb[index * 3],
+                        self.rgb[index * 3 + 1],
+                        self.rgb[index * 3 + 2],
+                    ];
+                    let level = self.level[index];
+                    let t = ((level - knee) / span).clamp(0.0, 1.0);
+                    let t = t * t * (3.0 - 2.0 * t);
+                    let base_gain = 1.0 + (max_boost - 1.0) * t;
+                    let gain = if active {
+                        masks.gain_at(
+                            &prepared,
+                            index,
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                            fw,
+                            fh,
+                            level,
+                            rgb,
+                            base_gain,
+                            tone,
+                        )
+                    } else {
+                        base_gain
+                    };
+                    for channel in 0..3 {
+                        let linear = srgb_eotf(rgb[channel] as f32 / 255.0) * gain * exposure;
+                        // Clamp in linear light before re-encoding: that is the
+                        // clip a real display imposes, and it keeps highlights
+                        // from banding as they compress.
+                        let encoded = srgb_oetf(linear.clamp(0.0, 1.0));
+                        pixel[channel] = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
+                    }
+                    pixel[3] = 255;
+                }
+            });
+        out
+    }
+}
+
 /// Convert one file. `dst` is written on success.
 pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
     let started = Instant::now();
@@ -738,7 +690,7 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
     // ---- gain map --------------------------------------------------------
     let tone = resolve_tone(&primary, settings);
     let (gain_image, gain_metadata) =
-        build_gain_map_with(&primary, settings.scale, tone, &settings.paint);
+        build_gain_map_with(&primary, settings.scale, tone, &settings.masks);
     let (gain_width, gain_height) = (gain_image.width, gain_image.height);
     let peak_boost = gain_metadata.max_content_boost[0];
 
@@ -801,21 +753,21 @@ pub fn convert(src: &Path, dst: &Path, settings: &Settings) -> Result<Report> {
 /// shadows stay untouched, highlights expand up to `max_boost`.
 pub fn build_gain_map(primary: &RawImage, settings: &Settings) -> (RawImage, GainMapMetadata) {
     let tone = resolve_tone(primary, settings);
-    build_gain_map_with(primary, settings.scale, tone, &settings.paint)
+    build_gain_map_with(primary, settings.scale, tone, &settings.masks)
 }
 
 /// [`build_gain_map`] with the curve given explicitly, for callers that already
 /// resolved it (or measured it, as the automatic path does).
 ///
-/// `paint` is composited on top of the curve: wherever its coverage is zero the
-/// automatic value survives untouched, and the painted target takes over by the
-/// amount actually drawn. That is why painting adds to the automatic result
-/// instead of replacing it.
+/// `masks` is folded on top of the global curve in **gain space**: every layer
+/// lerps the running gain toward the gain its own curve would produce, so the
+/// result stays between the base and the layer's ceiling instead of adding
+/// stops. Where no mask reaches, the global value survives byte for byte.
 pub fn build_gain_map_with(
     primary: &RawImage,
     scale: u32,
     tone: ToneParams,
-    paint: &PaintLayer,
+    masks: &MaskStack,
 ) -> (RawImage, GainMapMetadata) {
     let width = primary.width;
     let height = primary.height;
@@ -829,10 +781,15 @@ pub fn build_gain_map_with(
     let span = (1.0 - knee).max(1e-6);
     let luma = luma_coefficients(primary.gamut);
 
-    // Coverage and painted target live at gain-map resolution: the mask is at
-    // most a quarter of the picture, and `scale` already averages it.
-    let (coverage, painted) = paint.rasterize(gain_width, gain_height);
-    let painted_active = coverage.iter().any(|&c| c > 0.0);
+    // Masks are evaluated at gain-map resolution: the buffer is at most a
+    // quarter of the picture, and `scale` already averages it.
+    let mask_active = masks.has_effect();
+    let prepared = if mask_active {
+        masks.prepare(gain_width, gain_height)
+    } else {
+        Vec::new()
+    };
+    let (fw, fh) = (gain_width as f32, gain_height as f32);
 
     let mut data = vec![0u8; (gain_width as usize) * (gain_height as usize)];
 
@@ -845,29 +802,41 @@ pub fn build_gain_map_with(
             for (gx, slot) in row.iter_mut().enumerate() {
                 let sx = ((gx as u32) * scale + scale / 2).min(width - 1);
                 let idx = (base + sx * 3) as usize;
-                let luminance = luma[0] * srgb_eotf(primary.data[idx] as f32 / 255.0)
-                    + luma[1] * srgb_eotf(primary.data[idx + 1] as f32 / 255.0)
-                    + luma[2] * srgb_eotf(primary.data[idx + 2] as f32 / 255.0);
+                let rgb = [
+                    primary.data[idx],
+                    primary.data[idx + 1],
+                    primary.data[idx + 2],
+                ];
+                let luminance = luma[0] * srgb_eotf(rgb[0] as f32 / 255.0)
+                    + luma[1] * srgb_eotf(rgb[1] as f32 / 255.0)
+                    + luma[2] * srgb_eotf(rgb[2] as f32 / 255.0);
 
                 let level = srgb_oetf(luminance.clamp(0.0, 1.0));
-                let mut t = ((level - knee) / span).clamp(0.0, 1.0);
-                t = t * t * (3.0 - 2.0 * t); // smoothstep
+                let t = ((level - knee) / span).clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t); // smoothstep
+                let base_gain = 1.0 + (max_boost - 1.0) * t;
 
-                if painted_active {
-                    let index = row_start + gx;
-                    let cover = coverage[index];
-                    if cover > 0.0 {
-                        // `painted` is the fraction of the full boost the brush
-                        // asks for; blend the curve's own fraction toward it.
-                        let target = painted[index].clamp(0.0, 1.0);
-                        t = t * (1.0 - cover) + target * cover;
-                    }
-                }
-
-                let gain = 1.0 + (max_boost - 1.0) * t;
+                let gain = if mask_active {
+                    masks.gain_at(
+                        &prepared,
+                        row_start + gx,
+                        gx as f32 + 0.5,
+                        gy as f32 + 0.5,
+                        fw,
+                        fh,
+                        level,
+                        rgb,
+                        base_gain,
+                        tone,
+                    )
+                } else {
+                    base_gain
+                };
 
                 *slot = if log_max > 1e-6 {
-                    ((gain.ln() / log_max) * 255.0).round().clamp(0.0, 255.0) as u8
+                    ((gain.clamp(1.0, max_boost).ln() / log_max) * 255.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
                 } else {
                     0
                 };
