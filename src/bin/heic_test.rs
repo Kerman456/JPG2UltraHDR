@@ -79,6 +79,19 @@ fn main() -> Result<()> {
         println!("注意：容器里找不到 Exif 头（源文件可能本来就没有）");
     }
 
+    // Android galleries decide whether a HEIC is HDR by looking for the Adobe
+    // `hdrgm` XMP packet, not by scanning for the ISO 21496-1 `tmap` item. A
+    // file with only `tmap` opens as an ordinary SDR photo there: the OnePlus
+    // gallery showed no HDR at all until this packet was added, so assert it.
+    let xmp_markers = count_subslice(&heic, b"http://ns.adobe.com/hdr-gain-map/1.0/");
+    let version_markers = count_subslice(&heic, b"hdrgm:Version=");
+    println!("容器内 hdrgm XMP {xmp_markers} 处，hdrgm:Version {version_markers} 处");
+    if xmp_markers == 0 || version_markers == 0 {
+        return Err(anyhow::anyhow!(
+            "缺少 hdrgm XMP 信令，Android 相册不会把这张 HEIC 当成 HDR 显示"
+        ));
+    }
+
     let back = heifer::hdr::decode_hdr_with_options(
         &heic,
         &heifer::Options::new(),

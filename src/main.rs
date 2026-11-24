@@ -563,6 +563,13 @@ impl App {
                 }
                 OutputFormat::Heic => {
                     ui.metadata_label("走 HEVC 编码，体积约为 JPG 的 60%，20 MP 需要 10–15 秒。");
+                    // OnePlus / OPPO / realme galleries ignore the standard
+                    // ISO 21496-1 gain map item and look for a JPEG segment
+                    // instead, so a standard HEIC shows up as plain SDR there.
+                    // Say so before the user converts a whole batch.
+                    ui.metadata_label(
+                        "注意：一加 / OPPO / realme 的相册只认自家 ProXDR，标准 HEIC 在这些手机上不显示 HDR；要那种效果请输出 JPG。",
+                    );
                 }
             }
 

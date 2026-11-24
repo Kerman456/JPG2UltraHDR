@@ -13,9 +13,9 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 
 不想自己编译的话，直接下打包好的版本：
 
-> **Windows**：[JPG2UltraHDR-v0.1.5-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.5/JPG2UltraHDR-v0.1.5-windows-x64.zip) — 解压即用，含主程序、说明文档和两个检查工具。
+> **Windows**：[JPG2UltraHDR-v0.1.6-windows-x64.zip](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.6/JPG2UltraHDR-v0.1.6-windows-x64.zip) — 解压即用，含主程序、说明文档和两个检查工具。
 >
-> **Android**：[JPG2UltraHDR-0.1.5-arm64.apk](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.5/JPG2UltraHDR-0.1.5-arm64.apk) — 直接装，需要 Android 10 或更高。
+> **Android**：[JPG2UltraHDR-0.1.6-arm64.apk](https://github.com/Kerman456/JPG2UltraHDR/releases/download/v0.1.6/JPG2UltraHDR-0.1.6-arm64.apk) — 直接装，需要 Android 10 或更高。
 
 ![深色主题](docs/screenshot-dark.png)
 
@@ -57,7 +57,8 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 也可以把文件直接拖到 exe 图标上启动。
 
 想要更小的文件，可以在「输出格式」里选 **HEIC**，得到 `DSC_0227_hdr.heic` —— 但会比 JPG 慢 4–5 倍，
-20 MP 的一张大约 6–7 秒。
+20 MP 的一张大约 6–7 秒。注意一加 / OPPO / realme 的相册不显示 HEIC 的 HDR 效果，
+这几家的手机请用 JPG，原因见「兼容性」一节。
 
 ### Android 版
 
@@ -78,7 +79,7 @@ Windows 版是单文件绿色程序，无需安装、无需 .NET 或 VC++ 运行
 | 主图质量 | 92 | SDR 主图 JPEG 编码质量 |
 | 增益图质量 | 90 | 增益图 JPEG 编码质量 |
 | 增益图分辨率 | 半分辨率 | 全 / 半 / 四分之一。半分辨率在体积与画质间最平衡 |
-| 输出格式 | JPG | JPG / HEIC。HEIC 体积约为 JPG 的 60%，但慢 4–5 倍，且仅 Windows 版支持 |
+| 输出格式 | JPG | JPG / HEIC。HEIC 体积约为 JPG 的 60%，但慢 4–5 倍，且仅 Windows 版支持；一加 / OPPO / realme 相册不显示 HEIC 的 HDR |
 | 提亮上限 | 3.0× | HDR 显示时高光最亮可达 SDR 的多少倍。2–4 最自然，8 以上会明显失真 |
 | 提亮起点 | 0.55 | 从哪个亮度开始参与提亮。越小则越多中间调被提亮 |
 | 自动推断提亮参数 | 开 | 按每张照片自身的亮度分布算出上面两个值，逐张计算 |
@@ -219,6 +220,27 @@ mdat   压缩后的 HEVC 码流
 - **普通查看器**（画图、旧版看图软件、网页）：只读第一张 JPEG，照常显示 SDR 画面
 - 与 Google 的 Ultra HDR / Adobe 的增益图规范兼容（ISO 21496-1 + `hdrgm` XMP + MPF）
 
+### JPG 与 HEIC 的兼容范围不同
+
+JPG 输出是 Google Ultra HDR 的标准封装，兼容面最广；HEIC 输出是 ISO 21496-1 的标准封装
+（`tmap` 增益图项 + `hdrgm` XMP 双写，与 Android 官方文档建议一致），在 Apple 生态、
+Chrome、以及 Android 15 及以上的原生 `ImageDecoder` 上都正常。
+
+**例外是一加 / OPPO / realme 的相册。** 实测（一加 15T + ColorOS 相册 17.24.72）它在打开我们的
+HEIC 时直接报：
+
+```
+W/GainmapDecodeHelper: findGainmapOffset. Failed. no jpegSections.
+E/ImageHdr: gainmap decode failed!
+```
+
+从相册 APK 里能读到它找增益图的完整链路是「扫描 JPEG 分段 → 读 MPF → 读主图 XMP」，
+`jpegSections` 是硬要求。HEIC 里没有 JPEG 分段，于是它判定「没有增益图」，按普通 SDR 照片显示 ——
+文件里的 `tmap` 和 XMP 它都没读。这几家相机自己拍的 HDR 照片用的是私有 **ProXDR** 封装
+（HEIC 基图 + 追加的裸 JPEG 增益图 + 文件尾一段 `jxrs` JSON 清单），并不是 ISO 21496-1。
+
+所以：**要在这三类手机上看到 HDR，请输出 JPG。**
+
 ## 已知限制
 
 - 增益图是**推导**出来的，不是真实拍摄的 HDR 信息。它做的是「让高光更亮」，不会凭空恢复已经过曝死白的细节。
@@ -228,6 +250,9 @@ mdat   压缩后的 HEVC 码流
 - HEIC 输出有两个固定限制（heifer 决定的，绕不过去）：增益图一律写成**半分辨率**，所以「增益图分辨率」
   选全尺寸或四分之一时会被采样到半尺寸；编码速度比 JPG 慢 4–5 倍。HEIC 也只在 Windows 版提供，
   安卓版即使配置文件里写着 `format=heic` 也会退回 JPG 并提示。
+- **一加 / OPPO / realme 的相册不显示 HEIC 的 HDR 效果**（其余查看器正常）。原因见上面
+  「JPG 与 HEIC 的兼容范围不同」—— 它的增益图查找要求文件里存在 JPEG 分段，而 HEIC 按定义没有。
+  这不是元数据写错，是对方走了私有 ProXDR 通路；这些手机上请用 JPG 输出。
 
 ## 从源码构建
 
@@ -285,6 +310,17 @@ cargo run --release --bin tone_probe -- "D:\Photos\0425\照片\未命名导出"
 
 # HEIC 保真自检：编码后回读，比对增益图、蒙版穿透与重建误差
 cargo run --release --bin heic_test -- src.jpg
+
+# 打印 HEIC 容器里的头空间与 XMP（排查播放器不识别 HDR 用）
+cargo run --release --bin heic_probe -- photo_hdr.heic
+
+# 性能剖析：逐阶段计时，看时间到底花在哪
+cargo run --release --bin profile -- src.jpg
+
+# 并发与编码器基准（文档 docs/gpu-acceleration.md 的数据来源）
+cargo run --release --bin bench_concurrency -- src.jpg jpg "1,2,4,8,16"
+cargo run --release --bin bench_encode_split -- src.jpg
+cargo run --release --bin bench_heifer_threads -- src.jpg
 ```
 
 ## 实现说明
@@ -317,6 +353,14 @@ Google 的 libultrahdr 从 2.0.0（2026-08）才开始支持 HEIF 输出，而�
 自己实现了 HEVC 编码和 ISO 21496-1 的写入。它虽然没有「直接塞一张增益图」的 API，
 但从 `(SDR, HDR)` 反推的公式是确定的，我们把 HDR 按 `linear(SDR) × gain` 构造好交过去，
 存进去的就是同一张图。
+
+### 为什么没有用 GPU 加速
+
+结论是不值得，完整论证与实测数据见 [`docs/gpu-acceleration.md`](docs/gpu-acceleration.md)。
+一句话版本：单张 JPG 的 1.2 秒里 90% 是单线程熵编码，而 GPU 的 JPEG 编码器不支持渐进式
+（改基线会让文件更大、还丢掉渐进式加载）；HEIC 那边已经把 24 核用满、1 到 24 线程提速 10.8 倍，
+属于算力不够而不是没并行，但 NVENC 只能出视频码流、拼不出 HEIF 静帧容器。
+真正值得做的是三条 CPU 优化，文档最后有排序。
 
 ## 技术栈
 

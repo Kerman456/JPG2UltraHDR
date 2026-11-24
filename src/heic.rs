@@ -26,10 +26,54 @@
 //!   geometry is preserved, edges soften slightly;
 //! * there is no metadata path for an arbitrary gain map, so `max_boost` must
 //!   come from the gain map we built — it does.
+//!
+//! `heifer` writes the gain map only as an ISO 21496-1 `tmap` item and no XMP at
+//! all. That is enough for readers that scan for `tmap`, but Android galleries —
+//! OnePlus/Oppo among them — key on the Adobe `hdrgm` XMP packet instead, so a
+//! file without it opens as a plain SDR photo. [`gain_map_xmp`] supplies that
+//! packet; the numbers come straight from [`GainMapMetadata`], so the two
+//! descriptions of the same gain map cannot drift apart.
 
 use anyhow::{Result, anyhow};
 use ultrahdr_core::color::srgb_eotf;
 use ultrahdr_core::{GainMapMetadata, RawImage};
+
+/// The Adobe `hdrgm` XMP packet that signs a HEIC as an HDR gain-map image.
+///
+/// Android galleries do not look for the ISO 21496-1 `tmap` item on their own;
+/// they look for `hdrgm:Version` in the primary image's XMP, which the Adobe
+/// gain-map specification calls a "fast signaling or detection mechanism".
+/// Without this packet an Ultra HDR HEIC opens as an ordinary SDR photo on the
+/// OnePlus/Oppo gallery, which is exactly what happened before it was added.
+///
+/// The gains are `log2` values, as in the ISO metadata; `max_boost` goes in both
+/// `GainMapMax` and `HDRCapacityMax` because a file with no gain below 1 has the
+/// same floor and ceiling.
+///
+/// The offsets are zero, matching the `tmap` payload `heifer` writes. The JPEG
+/// path uses 1/64 because `ultrajpeg` puts it in its own ISO metadata; repeating
+/// that here would describe a different gain map from the one in the file, and
+/// readers that honour the XMP would lift the blacks.
+fn gain_map_xmp(max_boost: f32) -> String {
+    let boost = max_boost.log2();
+    format!(
+        r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="JPG2UltraHDR">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about=""
+        xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
+        hdrgm:Version="1.0"
+        hdrgm:GainMapMin="0.000000"
+        hdrgm:GainMapMax="{boost:.6}"
+        hdrgm:Gamma="1.000000"
+        hdrgm:OffsetSDR="0.000000"
+        hdrgm:OffsetHDR="0.000000"
+        hdrgm:HDRCapacityMin="0.000000"
+        hdrgm:HDRCapacityMax="{boost:.6}"
+        hdrgm:BaseRenditionIsHDR="False"/>
+  </rdf:RDF>
+</x:xmpmeta>"#
+    )
+}
 
 /// Encode `primary` + `gain` as a single HEIC file.
 ///
@@ -108,7 +152,7 @@ pub fn encode(
 
     let metadata = heifer::Metadata {
         exif: exif.map(<[u8]>::to_vec),
-        xmp: None,
+        xmp: Some(gain_map_xmp(max_boost).into_bytes()),
         icc_profile: icc.map(<[u8]>::to_vec),
     };
     let options = heifer::EncodeOptions::new().with_quality(quality.clamp(1, 100));
